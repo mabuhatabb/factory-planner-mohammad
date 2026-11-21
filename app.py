@@ -1163,7 +1163,7 @@ with tab_saved:
             hc = alt.Chart(long).mark_line(point=True).encode(
                 x=alt.X("week:T", title="Week starting"), y=alt.Y("value:Q", title=None),
                 color=alt.Color("measure:N", title=None, legend=None), tooltip=["week", "measure", "value"]
-            ).properties(height=170).facet(column=alt.Column("measure:N", title=None)).resolve_scale(y="independent")
+            ).properties(height=170, width=300).facet(column=alt.Column("measure:N", title=None)).resolve_scale(y="independent")
             st.altair_chart(hc)
             if len(hist) == 1:
                 st.caption("Save plans in different weeks to see a trend.")
