@@ -713,13 +713,21 @@ with tab_plan:
         delivered = int(orders["status"].isin(["On time", "Late"]).sum())
         if "focus" not in st.session_state:
             st.session_state["focus"] = "All orders"
-        cards = [("Orders delivered", delivered, "Delivered", "On time + late"),
-                 ("Orders on time", int((orders["status"] == "On time").sum()), "On time", None),
-                 ("Late orders", late, "Late", None),
-                 ("Not scheduled", notp, "Not scheduled", None),
-                 ("Overtime hours", ot_hours, "Overtime", None)]
-        for col, (label, value, key, hint) in zip(st.columns(5), cards):
+        pin = (st.session_state.get("plan_inputs") or data)["orders"]
+        qty_of = {str(o_).strip(): (0 if pd.isna(q_) else float(q_)) for o_, q_ in zip(pin["order_id"], pin["quantity"])}
+        def units(mask):
+            n = sum(qty_of.get(o_, 0) for o_ in orders.loc[mask, "order_id"])
+            return f"{n:g} units"
+        cards = [("Orders delivered", delivered, "Delivered", "Number of orders. The line below is the total units (quantity) in them.",
+                  units(orders["status"].isin(["On time", "Late"]))),
+                 ("Orders on time", int((orders["status"] == "On time").sum()), "On time", None, units(orders["status"] == "On time")),
+                 ("Late orders", late, "Late", None, units(orders["status"] == "Late")),
+                 ("Not scheduled", notp, "Not scheduled", None, units(orders["status"] == "Not scheduled")),
+                 ("Overtime hours", ot_hours, "Overtime", None, None)]
+        for col, (label, value, key, hint, sub) in zip(st.columns(5), cards):
             col.metric(label, value, help=hint)
+            if sub:
+                col.caption(sub)
             if col.button("Show list", key=f"focus_{key}", type="primary" if st.session_state["focus"] == key else "secondary"):
                 st.session_state["focus"] = key
                 st.rerun()
@@ -728,7 +736,17 @@ with tab_plan:
         if notp:
             st.warning("Some orders do not fit in the days planned. Add capacity, add days, or move due dates.")
 
-        due = data["orders"].assign(order_id=data["orders"]["order_id"].astype(str).str.strip())[
+        snap = (st.session_state.get("plan_inputs") or data)
+        try:
+            stale = any(
+                not snap[k].reset_index(drop=True).astype(str).equals(data[k].reset_index(drop=True).astype(str))
+                for k in ("orders", "routing", "resources", "stock") if k in snap and k in data)
+        except Exception:
+            stale = False
+        if stale:
+            st.warning("You changed the data tables after this plan was made, so the numbers below are for the OLD data "
+                       "(the units and dates the plan used). Press Make plan to plan the new data.")
+        due = snap["orders"].assign(order_id=snap["orders"]["order_id"].astype(str).str.strip())[
             ["order_id", "product_type", "quantity", "due_date", "priority", "order_value"]]
         due["due_date"] = pd.to_datetime(due["due_date"], errors="coerce").dt.date
         show = orders.merge(due, on="order_id", how="left")
