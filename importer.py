@@ -10,10 +10,10 @@ import tables
 
 # field -> (label, words that suggest the column, required)
 FIELDS = {
-    "order_id": ("Order / PO number", ["po", "order", "project", "job", "contract"], True),
+    "order_id": ("Order / PO number", ["po", "order", "project", "proj", "job", "contract", "ref", "reference", "id", "number"], True),
     "product_type": ("Product type", ["product", "type", "model", "unit", "equipment"], True),
     "quantity": ("Quantity", ["qty", "quantity", "units", "count", "no. of"], False),
-    "due_date": ("Due / site date", ["due", "delivery", "site", "deadline", "need"], True),
+    "due_date": ("Due / site date", ["due", "delivery", "handover", "hand over", "completion", "site", "deadline", "need", "ship"], True),
     "priority": ("Priority", ["priority", "rank", "importance"], False),
     "start_not_before": ("Earliest start", ["release", "earliest", "start", "kickoff"], False),
     "status": ("Status", ["status", "state", "stage"], False),
@@ -25,8 +25,13 @@ def _norm(s):
     return re.sub(r"[^a-z0-9 ]", " ", str(s).lower())
 
 
+NOT_A_FIELD = ["manager", "comment", "note", "name", "crane", "phone", "email", "address", "remark"]
+
+
 def _score(col, words):
     c = _norm(col)
+    if any(w in c for w in NOT_A_FIELD):
+        return 0
     return max([len(w) / (len(c) + 1) + 1 for w in words if w in c] or [0])
 
 
@@ -84,32 +89,95 @@ def read_frames(name, data):
     return frames
 
 
+def _money(v):
+    """'$450,000' -> 450000.0, '1.2M' -> 1200000.0, 'n/a' -> None."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return None if pd.isna(v) else float(v)
+    t = re.sub(r"[^0-9.kKmM-]", "", str(v or ""))
+    if not t or t in ("-", "."):
+        return None
+    mult = 1
+    if t[-1] in "kK":
+        mult, t = 1_000, t[:-1]
+    elif t[-1] in "mM":
+        mult, t = 1_000_000, t[:-1]
+    try:
+        return float(t) * mult
+    except ValueError:
+        return None
+
+
+def _count(v):
+    """5, '5', '5 pcs', '12' -> number; 'two', '' -> None."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return None if pd.isna(v) else float(v)
+    m = re.match(r"\s*(-?\d+(?:[.,]\d+)?)", str(v or ""))
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def _when(v):
+    """Dates written as text, real dates, or Excel serial numbers. Anything else -> None."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and not pd.isna(v):
+        if 20000 < v < 80000:
+            return (pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))).date()
+        return None
+    return tables._date(v)
+
+
+SKIP_IDS = ("total", "sum", "subtotal", "grand total", "average", "count")
+
+
 def build_orders(frames, mapping, status_col_values=None, default_priority=1, default_qty=1):
     """Combine the chosen sheets into the Orders table.
 
     mapping: {sheet: {field: column}}. status_col_values: statuses to keep (None = keep all).
     """
-    rows = []
+    rows, notes, seen = [], [], {}
     for sheet, m in mapping.items():
         df = frames[sheet]
-        for _, r in df.iterrows():
+        for n, (_, r) in enumerate(df.iterrows(), start=1):
             get = lambda f: r[m[f]] if m.get(f) in df.columns else None
             row = {f: get(f) for f in tables.ORDERS}
             st_val = tables._text(row.get("status"))
             if status_col_values is not None and st_val.lower() not in [s.lower() for s in status_col_values]:
                 continue
-            if not tables._text(row["order_id"]):
+            oid = tables._text(row["order_id"])
+            if not oid or oid.lower().startswith(SKIP_IDS):
                 continue
-            row["quantity"] = tables._num(row["quantity"], default_qty)
-            row["priority"] = tables._num(row["priority"], default_priority)
-            row["due_date"] = tables._date(row["due_date"])
-            row["start_not_before"] = tables._date(row["start_not_before"])
-            row["order_id"] = tables._text(row["order_id"])
-            row["product_type"] = tables._text(row["product_type"])
-            row["status"] = st_val
-            row["order_value"] = tables._num(row["order_value"], None)
-            rows.append(row)
-    return pd.DataFrame(rows, columns=tables.ORDERS)
+            where = f"{sheet}, row {n}: {oid}"
+            q = _count(row["quantity"])
+            if q is None:
+                if tables._text(row["quantity"]):
+                    notes.append(f"{where}: quantity '{tables._text(row['quantity'])}' is not a number. Used {default_qty:g}.")
+                q = default_qty
+            elif q <= 0:
+                notes.append(f"{where}: quantity {q:g} is not above zero. Used {default_qty:g}.")
+                q = default_qty
+            elif q != int(q):
+                notes.append(f"{where}: quantity {q:g} is not a whole number. Rounded up.")
+                q = float(-(-q // 1))
+            p = _count(row["priority"])
+            if p is None or not (1 <= p <= 10):
+                if tables._text(row["priority"]):
+                    notes.append(f"{where}: priority '{tables._text(row['priority'])}' is not 1 to 10. Used {default_priority}.")
+                p = default_priority
+            due = _when(row["due_date"])
+            if due is None:
+                notes.append(f"{where}: due date '{tables._text(row['due_date'])}' is missing or not a date. The order cannot be planned until you fix it.")
+            rel = _when(row["start_not_before"])
+            if rel is None and tables._text(row["start_not_before"]):
+                notes.append(f"{where}: earliest start '{tables._text(row['start_not_before'])}' is not a date. Ignored.")
+            val = _money(row["order_value"])
+            if val is None and tables._text(row["order_value"]):
+                notes.append(f"{where}: order value '{tables._text(row['order_value'])}' is not a number. Left blank.")
+            if oid in seen:
+                notes.append(f"{where}: the same order number appears again (first on {seen[oid]}). Both rows were kept: rename one.")
+            seen.setdefault(oid, where)
+            rows.append({"order_id": oid, "product_type": tables._text(row["product_type"]), "quantity": q,
+                         "due_date": due, "priority": p, "start_not_before": rel, "status": st_val, "order_value": val})
+    out = pd.DataFrame(rows, columns=tables.ORDERS)
+    out.attrs["notes"] = notes
+    return out
 
 
 def render_import(on_done):
@@ -155,6 +223,11 @@ def render_import(on_done):
         keep = st.multiselect("Keep only rows with these statuses", vals, default=default, key="imp_status")
     orders = build_orders(frames, mapping, keep)
     st.write(f"{len(orders)} orders found.")
+    notes = orders.attrs.get("notes", [])
+    if notes:
+        with st.expander("1 thing to check in this file" if len(notes) == 1 else f"{len(notes)} things to check in this file", expanded=True):
+            for n_ in notes:
+                st.write("- " + n_)
     st.dataframe(orders, hide_index=True, width="stretch")
     if len(orders) and st.button("Use these orders", type="primary", key="imp_use"):
         on_done(orders)

@@ -79,7 +79,10 @@ def _date(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return None
     try:
-        out = pd.to_datetime(v, errors="coerce")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = pd.to_datetime(v, errors="coerce")
     except Exception:
         return None
     if pd.isna(out):
@@ -268,7 +271,7 @@ def prepare(tables, plan_start, settings):
     # routing
     routes = {}
     for _, r in t["routing"].iterrows():
-        pt = _text(r["product_type"])
+        pt = " ".join(_text(r["product_type"]).lower().split())
         if not pt:
             continue
         routes.setdefault(pt, []).append(r)
@@ -294,11 +297,12 @@ def prepare(tables, plan_start, settings):
             problems.append(f"Orders: '{oid}' appears more than once.")
             continue
         seen.add(oid)
-        pt = _text(o["product_type"])
+        pt_shown = _text(o["product_type"])
+        pt = " ".join(pt_shown.lower().split())          # capital letters and extra spaces do not matter
         qty = _num(o["quantity"], None)
         due = _date(o["due_date"])
         if pt not in routes:
-            skipped.append({"order_id": oid, "reason": f"No routing for product type '{pt}'."})
+            skipped.append({"order_id": oid, "reason": f"No routing for product type '{pt_shown}'. Add it in Routing, or use a name that exists there."})
             continue
         if qty is None or qty <= 0:
             skipped.append({"order_id": oid, "reason": "Quantity is blank or not above zero."})
@@ -373,10 +377,25 @@ def to_workbook(tables):
 
 
 def from_workbook(file):
+    """Read a planner workbook (sheets named orders, routing, resources, exceptions, parts, stock)."""
     xls = pd.ExcelFile(file)
-    out = {}
+    keyed = {}
+    for sn in xls.sheet_names:
+        keyed[sn.strip().lower().replace(" ", "_")] = sn
+    for k, title in TITLES.items():                       # the sheet may also carry the screen title
+        keyed.setdefault(title.strip().lower().replace(" ", "_"), None)
+    out, found = {}, 0
     for name in COLUMNS:
-        out[name] = xls.parse(name) if name in xls.sheet_names else pd.DataFrame(columns=COLUMNS[name])
+        sheet = keyed.get(name) or next((keyed[t] for t in (TITLES[name].strip().lower().replace(" ", "_"),) if keyed.get(t)), None)
+        if sheet:
+            out[name] = xls.parse(sheet)
+            found += 1
+        else:
+            out[name] = pd.DataFrame(columns=COLUMNS[name])
+    if not found:
+        raise ValueError("This is not a planner workbook: it has no sheet named orders, routing, resources, exceptions, parts or stock "
+                         f"(its sheets are: {', '.join(xls.sheet_names)}). To bring in your customer's schedule, use "
+                         "'Import orders from your own schedule file' just below. Nothing was changed.")
     return normalize(out)
 
 

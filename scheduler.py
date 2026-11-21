@@ -184,13 +184,23 @@ def _solve_model(jobs, cap, days, settings=None):
     # Phase 1: fit as many orders as possible (priority-weighted)
     weights = [int(j_["priority"]) if s["use_priority"] else 1 for j_ in jobs]
     model.Maximize(sum(weights[j] * inc[j] for j in range(len(jobs))))
+    for j in range(len(jobs)):
+        model.AddHint(inc[j], 0)             # "plan nothing" is always allowed: gives the solver a safe start
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = max(1.0, total_time / 3)
     solver.parameters.num_workers = workers
     solver.parameters.random_seed = 1
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {"status": "none"}
+        # large data: the first search needs more time. Try once more with the whole time limit.
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(2.0, total_time)
+        solver.parameters.num_workers = workers
+        solver.parameters.random_seed = 1
+        status = solver.Solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return {"status": "none"}
+    phase1_proven = status == cp_model.OPTIMAL
     best_fit = int(round(solver.ObjectiveValue()))
     model.Add(sum(weights[j] * inc[j] for j in range(len(jobs))) >= best_fit)
     model.ClearHints()
@@ -262,7 +272,7 @@ def _solve_model(jobs, cap, days, settings=None):
                              "overtime": int(max(0, hours + setup - caps[d]))})
 
     return {
-        "status": "optimal" if status == cp_model.OPTIMAL else "feasible",
+        "status": "optimal" if (status == cp_model.OPTIMAL and phase1_proven) else "feasible",
         "orders": orders_rows, "steps": steps_rows, "daily": daily, "load": load,
     }
 

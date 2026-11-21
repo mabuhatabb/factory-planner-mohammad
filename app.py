@@ -306,7 +306,10 @@ if "base" not in st.session_state:
 
 def set_tables(new, keep_others=False):
     cur = dict(st.session_state["base"]) if keep_others else tables.blank()
-    cur.update(tables.normalize(new) if not keep_others else {k: v for k, v in tables.normalize(new).items()})
+    norm = tables.normalize(new)
+    if keep_others:
+        norm = {k: v for k, v in norm.items() if k in new}      # only the tables that were given; keep the rest
+    cur.update(norm)
     st.session_state["base"] = tables.normalize(cur)
     st.session_state["ver"] += 1
     st.session_state["edited"] = {}
