@@ -1,706 +1,443 @@
 import io
+from datetime import date
+
+import altair as alt
 import pandas as pd
 import streamlit as st
+
 import importer
-from planner import (make_plan, build_materials, empty_usage, empty_stock,
-                     DEFAULT_SETTINGS)
+import scheduler
+import store
+import tables
 
 st.set_page_config(page_title="Production Planner", layout="wide")
 
-# Font and size. Change 112.5% (100% = normal) or 'Inter' to taste.
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-html { font-size: 112.5%; }
-.stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp label,
-.stApp li, .stApp input, .stApp textarea, .stApp button {
-    font-family: 'Inter', sans-serif !important;
+HELP_SETTINGS = {
+    "horizon_days": "How many calendar days ahead the plan looks. Orders that do not fit are shown as Not scheduled.",
+    "late_cost": "Points lost for every day an order finishes after its due date. Higher = the planner fights harder to be on time.",
+    "earliness_weight": "Small push to finish things sooner. Keep it low (0 to 5) so it never beats on-time delivery.",
+    "use_priority": "If on, a priority 3 order counts three times as much as priority 1 when deciding who is late.",
+    "use_parts": "If on, a step cannot start before its parts arrive (Parts arrival tab).",
+    "gap_days": "Days between the end of one step and the start of the next (curing, transport, inspection). 0 = next day can follow immediately on the same day.",
+    "max_overtime": "Extra hours each crew may work on a working day beyond normal capacity. 0 = no overtime.",
+    "overtime_cost": "Points lost for each overtime hour. Higher = overtime only when really needed.",
+    "time_limit_seconds": "How long the solver may think. More time can give a better plan on big data.",
 }
-.stApp h1 { font-size: 2.2rem; }
-.stApp h2 { font-size: 1.6rem; }
-.stApp h3 { font-size: 1.25rem; }
-</style>
-""", unsafe_allow_html=True)
-
-# Limits that keep a public app responsive
-MAX_PRODUCTS = 50
-MAX_MACHINES = 10
-MAX_DAYS = 31
-MAX_QTY = 100000
-MAX_UPLOAD_ROWS = 1000
-
-PROD_COLS = ["product", "demand", "due_day", "priority", "minutes_per_unit"]
-MACH_COLS = ["machine", "day", "minutes_available"]
-ALLOWED_COLS = ["product", "machine"]
-USAGE_COLS = ["product", "material", "kg_per_unit"]
-STOCK_COLS = ["material", "day", "kg_available"]
 
 
-# ---------- DATA HELPERS ----------
-def example_data():
-    prod = pd.DataFrame([
-        {"product": "Product A", "demand": 40, "due_day": 1, "priority": 1, "minutes_per_unit": 10},
-        {"product": "Product B", "demand": 30, "due_day": 2, "priority": 2, "minutes_per_unit": 15},
-    ])
-    mach = pd.DataFrame([
-        {"machine": m, "day": d, "minutes_available": 200}
-        for m in ["Line 1", "Line 2"] for d in [1, 2, 3]
-    ])
-    allowed = pd.DataFrame([
-        {"product": "Product A", "machine": "Line 1"},
-        {"product": "Product B", "machine": "Line 1"},
-        {"product": "Product B", "machine": "Line 2"},
-    ])
-    usage = pd.DataFrame([
-        {"product": "Product A", "material": "Steel", "kg_per_unit": 2},
-        {"product": "Product B", "material": "Steel", "kg_per_unit": 3},
-    ])
-    stock = pd.DataFrame([
-        {"material": "Steel", "day": d, "kg_available": 100} for d in [1, 2, 3]
-    ])
-    return prod, mach, allowed, usage, stock
-
-
-def _blank(text_cols, num_cols):
-    data = {c: pd.Series(dtype="str") for c in text_cols}
-    data.update({c: pd.Series(dtype="float") for c in num_cols})
-    return pd.DataFrame(data)
-
-
-def blank_data():
-    return (
-        _blank(["product"], ["demand", "due_day", "priority", "minutes_per_unit"]),
-        _blank(["machine"], ["day", "minutes_available"]),
-        _blank(["product", "machine"], []),
-        _blank(["product", "material"], ["kg_per_unit"]),
-        _blank(["material"], ["day", "kg_available"]),
-    )
-
-
-def read_workbook(file):
-    """Read an uploaded workbook into the five input tables."""
-    xls = pd.ExcelFile(file)
-    required = [("products", PROD_COLS), ("machines", MACH_COLS), ("allowed", ALLOWED_COLS)]
-    optional = [("usage", USAGE_COLS), ("stock", STOCK_COLS)]
-    blanks = blank_data()
-    tables = []
-    for i, (sheet, cols) in enumerate(required + optional):
-        if sheet not in xls.sheet_names:
-            if (sheet, cols) in required:
-                raise ValueError(f"Sheet '{sheet}' is missing.")
-            tables.append(blanks[i])
-            continue
-        df = xls.parse(sheet)
-        missing = [c for c in cols if c not in df.columns]
-        if missing:
-            raise ValueError(f"Sheet '{sheet}' is missing columns: {', '.join(missing)}.")
-        if len(df) > MAX_UPLOAD_ROWS:
-            raise ValueError(f"Sheet '{sheet}' has more than {MAX_UPLOAD_ROWS} rows.")
-        tables.append(df[cols].copy())
-    return tuple(tables)
-
-
-def whole_numbers(df, cols):
-    return bool((df[cols] % 1 != 0).any().any())
-
-
-def build_inputs(prod, mach, allowed, usage_df, stock_df, use_materials):
-    """Check the tables and turn them into model inputs.
-    Raises ValueError(list_of_messages) when something must be fixed."""
-    errors, notes = [], []
-
-    prod = prod.dropna(subset=PROD_COLS).copy()
-    mach = mach.dropna(subset=MACH_COLS).copy()
-    allowed = allowed.dropna(subset=ALLOWED_COLS).copy()
-    usage_df = usage_df.dropna(subset=USAGE_COLS).copy()
-    stock_df = stock_df.dropna(subset=STOCK_COLS).copy()
-
-    for df, col in ((prod, "product"), (mach, "machine"),
-                    (allowed, "product"), (allowed, "machine"),
-                    (usage_df, "product"), (usage_df, "material"),
-                    (stock_df, "material")):
-        df[col] = df[col].astype(str).str.strip()
-
+# ---------------- database + login ----------------
+@st.cache_resource
+def engine():
+    url = None
     try:
-        num = [(prod, PROD_COLS[1:]), (mach, MACH_COLS[1:]),
-               (usage_df, ["kg_per_unit"]), (stock_df, STOCK_COLS[1:])]
-        for df, cols in num:
-            for c in cols:
-                df[c] = pd.to_numeric(df[c])
-    except (ValueError, TypeError):
-        raise ValueError(["A number column contains text. Use whole numbers only."])
-
-    if prod.empty:
-        errors.append("Table 1 has no complete rows. Add at least one order.")
-    if mach.empty:
-        errors.append("Table 2 has no complete rows. Add machine minutes for at least one day.")
-
-    for df, cols in num:
-        if not df.empty and whole_numbers(df, cols):
-            errors.append("Use whole numbers only (no decimals) in the number columns.")
-            break
-
-    dup = prod["product"][prod["product"].duplicated()].unique()
-    if len(dup):
-        errors.append(f"Duplicate product names in table 1: {', '.join(dup)}.")
-    if mach.duplicated(["machine", "day"]).any():
-        errors.append("Table 2 lists the same machine and day more than once.")
-    if ((prod["demand"] < 0) | (prod["demand"] > MAX_QTY)).any():
-        errors.append(f"Quantity ordered must be between 0 and {MAX_QTY}.")
-    if (prod["due_day"] < 1).any():
-        errors.append("Due day must be 1 or more.")
-    if (prod["priority"] < 1).any():
-        errors.append("Priority must be 1 or more.")
-    if (prod["minutes_per_unit"] < 1).any():
-        errors.append("Minutes per unit must be 1 or more.")
-    if (mach["day"] < 1).any():
-        errors.append("Table 2: day must be 1 or more.")
-    if (mach["minutes_available"] < 0).any():
-        errors.append("Table 2: minutes available cannot be negative.")
-    if (usage_df["kg_per_unit"] < 0).any() or (stock_df["kg_available"] < 0).any():
-        errors.append("Material amounts cannot be negative.")
-    if len(prod) > MAX_PRODUCTS:
-        errors.append(f"This app handles up to {MAX_PRODUCTS} products.")
-    if mach["machine"].nunique() > MAX_MACHINES:
-        errors.append(f"This app handles up to {MAX_MACHINES} machines.")
-    if mach["day"].nunique() > MAX_DAYS:
-        errors.append(f"This app handles up to {MAX_DAYS} days.")
-    if errors:
-        raise ValueError(errors)
-
-    machines = sorted(mach["machine"].unique())
-    days = sorted(int(d) for d in mach["day"].unique())
-    capacity = {(r.machine, int(r.day)): int(r.minutes_available) for r in mach.itertuples()}
-
-    products, dropped = {}, 0
-    for r in prod.itertuples():
-        wanted = allowed[allowed["product"] == r.product]["machine"].unique().tolist()
-        ok = [m for m in wanted if m in machines]
-        dropped += len(wanted) - len(ok)
-        products[r.product] = {
-            "demand": int(r.demand),
-            "due_day": int(r.due_day),
-            "priority": int(r.priority),
-            "minutes_per_unit": int(r.minutes_per_unit),
-            "machines": ok,
-        }
-
-    if dropped:
-        notes.append(f"{dropped} row(s) in table 3 name a machine that is not in table 2. They were ignored.")
-    unknown = allowed[~allowed["product"].isin(list(products))]
-    if len(unknown):
-        notes.append(f"{len(unknown)} row(s) in table 3 name a product that is not in table 1. They were ignored.")
-    no_machine = [p for p, info in products.items() if not info["machines"]]
-    if no_machine:
-        notes.append(f"No machine is allowed for: {', '.join(no_machine)}. Add a row in table 3.")
-
-    usage, stock = build_materials(usage_df, stock_df)
-    if usage and max(usage.values()) > 1000:
-        notes.append("Very large material use per unit in table 4. Check for typos.")
-    if use_materials:
-        unlimited = sorted({m for _, m in usage} - {m for m, _ in stock})
-        if unlimited:
-            notes.append(f"No stock listed in table 5 for: {', '.join(unlimited)}. "
-                         "These materials are treated as unlimited. Check the spelling.")
-    return products, machines, days, capacity, usage, stock, notes
+        url = st.secrets.get("DATABASE_URL")
+    except Exception:
+        url = None
+    return store.get_engine(url)
 
 
-def make_workbook(prod, mach, allowed, usage_df, stock_df, settings, runs):
-    def clean(df, cols):
-        return df[cols].dropna(how="all")
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        clean(prod, PROD_COLS).to_excel(writer, sheet_name="products", index=False)
-        clean(mach, MACH_COLS).to_excel(writer, sheet_name="machines", index=False)
-        clean(allowed, ALLOWED_COLS).to_excel(writer, sheet_name="allowed", index=False)
-        clean(usage_df, USAGE_COLS).to_excel(writer, sheet_name="usage", index=False)
-        clean(stock_df, STOCK_COLS).to_excel(writer, sheet_name="stock", index=False)
-        pd.DataFrame([{"parameter": k, "value": str(v)} for k, v in settings.items()]
-                     ).to_excel(writer, sheet_name="parameters", index=False)
-        if runs:
-            pd.DataFrame([{
-                "plan_id": r["id"], "name": r["name"],
-                "late_units": r["late_units"], "units_not_made": r["units_not_made"],
-                "overtime_minutes": r["overtime_minutes"],
-            } for r in runs]).to_excel(writer, sheet_name="runs", index=False)
-            frames = []
-            for r in runs:
-                f = r["plan"].copy()
-                f.insert(0, "plan_id", r["id"])
-                f.insert(1, "plan_name", r["name"])
-                frames.append(f)
-            pd.concat(frames).to_excel(writer, sheet_name="plans", index=False)
-    return buffer.getvalue()
-
-
-def po_summary(summary, plan):
-    """Roll the result up by PO. Works when product names look like 'PO | unit'."""
-    s = summary.copy()
-    s["PO"] = s["product"].map(lambda p: p.split(" | ")[0] if " | " in p else None)
-    s = s[s["PO"].notna()]
-    if s.empty:
+def invite_code():
+    try:
+        return st.secrets.get("INVITE_CODE")
+    except Exception:
         return None
-    g = s.groupby("PO", sort=False).agg(
-        ordered=("ordered", "sum"), made=("made", "sum"),
-        on_time=("on_time", "sum"), late=("late", "sum")).reset_index()
-    p = plan.copy()
-    p["PO"] = p["product"].map(lambda x: x.split(" | ")[0] if " | " in x else None)
-    last = p.dropna(subset=["PO"]).groupby("PO")["day"].max()
-    g["last_day_made"] = g["PO"].map(last).astype("Int64")
-    g["not_made"] = g["ordered"] - g["made"]
-
-    def status(r):
-        if r["not_made"] > 0:
-            return "Not complete"
-        return "Late" if r["late"] > 0 else "On time"
-
-    g["status"] = g.apply(status, axis=1)
-    return g[["PO", "ordered", "made", "not_made", "on_time", "late",
-              "last_day_made", "status"]]
 
 
-# ---------- SESSION STATE (private to each visitor) ----------
-for key, default in (("ver", 0), ("runs", []), ("feedback", []), ("next_id", 1),
-                     ("last", None), ("msgs", []), ("last_upload", None)):
-    if key not in st.session_state:
-        st.session_state[key] = default
-if "src" not in st.session_state:
-    st.session_state.src = example_data()
+def login_screen():
+    st.title("Production Planner")
+    st.caption("Sign in to plan your factory. Your data is private to your account.")
+    eng = engine()
+    if not store.is_hosted(eng):
+        st.warning("No hosted database is connected. Accounts and saved data are kept in a local file "
+                   "and will be lost when this app restarts on Streamlit Cloud. See the setup notes to add DATABASE_URL.")
+    tab_in, tab_up = st.tabs(["Sign in", "Create account"])
+    with tab_in:
+        with st.form("login"):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            if st.form_submit_button("Sign in", type="primary"):
+                uid, err = store.check_login(u, p, eng)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state["uid"] = uid
+                    st.session_state["username"] = u.strip().lower()
+                    st.rerun()
+    with tab_up:
+        code_needed = store.is_hosted(eng) and invite_code()
+        if store.is_hosted(eng) and not invite_code():
+            st.info("Sign-up is closed: the owner has not set an invite code.")
+        else:
+            with st.form("signup"):
+                u = st.text_input("Choose a username")
+                p = st.text_input("Choose a password (8+ characters)", type="password")
+                code = st.text_input("Invite code", type="password") if code_needed else ""
+                if st.form_submit_button("Create account"):
+                    if code_needed and code != str(invite_code()):
+                        st.error("Wrong invite code.")
+                    else:
+                        uid, err = store.create_user(u, p, eng)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.session_state["uid"] = uid
+                            st.session_state["username"] = u.strip().lower()
+                            st.rerun()
 
 
-def set_src(data):
-    st.session_state.src = data
-    st.session_state.ver += 1  # new editor keys reset the tables
-    st.session_state.last = None
-    st.session_state.msgs = []
+if "uid" not in st.session_state:
+    login_screen()
+    st.stop()
+
+uid = st.session_state["uid"]
+eng = engine()
+
+# ---------------- session data ----------------
+if "base" not in st.session_state:
+    st.session_state["base"] = tables.example()
+    st.session_state["ver"] = 0
+    st.session_state["edited"] = {}
 
 
-# ---------- HEADER ----------
+def set_tables(new, keep_others=False):
+    cur = dict(st.session_state["base"]) if keep_others else tables.blank()
+    cur.update(tables.normalize(new) if not keep_others else {k: v for k, v in tables.normalize(new).items()})
+    st.session_state["base"] = tables.normalize(cur)
+    st.session_state["ver"] += 1
+    st.session_state["edited"] = {}
+
+
+def current_tables():
+    out = dict(st.session_state["base"])
+    out.update(st.session_state["edited"])
+    return tables.normalize(out)
+
+
+# ---------------- sidebar ----------------
+with st.sidebar:
+    st.write(f"Signed in as **{st.session_state['username']}**")
+    if st.button("Sign out"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+    with st.expander("Change password"):
+        with st.form("pw"):
+            old = st.text_input("Current password", type="password")
+            new = st.text_input("New password", type="password")
+            if st.form_submit_button("Change"):
+                err = store.change_password(uid, old, new, eng)
+                st.error(err) if err else st.success("Password changed.")
+    st.divider()
+    st.header("Planning settings")
+    plan_start = st.date_input("Plan start date", value=date.today(), help="First day of the plan.")
+    S = {}
+    S["horizon_days"] = st.number_input("Days to plan", 14, 365, 90, help=HELP_SETTINGS["horizon_days"])
+    S["late_cost"] = st.number_input("Cost per late day", 0, 10000, 100, help=HELP_SETTINGS["late_cost"])
+    S["earliness_weight"] = st.number_input("Finish-early push", 0, 100, 1, help=HELP_SETTINGS["earliness_weight"])
+    S["use_priority"] = st.checkbox("Use priority", True, help=HELP_SETTINGS["use_priority"])
+    S["use_parts"] = st.checkbox("Wait for parts", True, help=HELP_SETTINGS["use_parts"])
+    S["gap_days"] = st.number_input("Days between steps", 0, 30, 1, help=HELP_SETTINGS["gap_days"])
+    S["max_overtime"] = st.number_input("Max overtime hours per day", 0, 12, 0, help=HELP_SETTINGS["max_overtime"])
+    S["overtime_cost"] = st.number_input("Cost per overtime hour", 0, 1000, 5, help=HELP_SETTINGS["overtime_cost"])
+    S["time_limit_seconds"] = st.number_input("Solver time (seconds)", 5, 300, 20, help=HELP_SETTINGS["time_limit_seconds"])
+
 st.title("Production Planner")
-st.caption("Enter your products, machines, and limits. The planner suggests what to make, "
-           "on which machine, and when. It is a recommendation for a person to review.")
-st.info("Your tables and plans are kept only for your current session and cleared when you "
-        "refresh or close the page. Use **Download my data** to keep your work.")
+tab_data, tab_plan, tab_saved = st.tabs(["1. Data", "2. Plan", "3. Saved and feedback"])
 
-with st.expander("How to use this app"):
-    st.markdown(
-        "1. Click **Load example** to see how it works, **Start blank** to enter your own, "
-        "or **import your own scheduling file** (Excel or CSV).\n"
-        "2. Fill table 1 (orders) and table 2 (machine minutes per day).\n"
-        "3. In table 3, choose which machines can make each product.\n"
-        "4. Optional: tables 4 and 5 limit the material available each day.\n"
-        "5. Adjust the **Parameters** in the sidebar (overtime, scoring, rules).\n"
-        "6. Click **Make plan**, then review it, give feedback, and compare plans."
-    )
-
-with st.expander("What does each column mean?"):
-    st.markdown("""
-| Table | Column | Meaning |
-| --- | --- | --- |
-| 1. Orders | Product | Name of the product or order line (must be unique) |
-| 1. Orders | Quantity ordered | How many units were ordered |
-| 1. Orders | Due day | Day number the order is due; later units count as late |
-| 1. Orders | Priority | Higher number = more important |
-| 1. Orders | Minutes per unit | Machine minutes to make one unit |
-| 2. Machine minutes | Machine | Machine, line, or team name |
-| 2. Machine minutes | Day | Day number, starting at 1 |
-| 2. Machine minutes | Minutes available | Minutes the machine can run that day (0 = down) |
-| 3. Allowed machines | Product / Machine | Which machine can make which product |
-| 4. Material per unit | Material, Kg per unit | Material name and kilograms used per unit |
-| 5. Material per day | Material, Day, Kg available | Kilograms available each day (no carry-over) |
-""")
-
-b1, b2, b3 = st.columns([1, 1, 4])
-if b1.button("Load example",
-             help="Fills the tables with a small demo so you can see how the app works."):
-    set_src(example_data())
-if b2.button("Start blank",
-             help="Empties all five tables so you can enter your own data."):
-    set_src(blank_data())
-file = b3.file_uploader(
-    "Or upload a workbook saved from this app (.xlsx)", type="xlsx",
-    help="A workbook you downloaded earlier with 'Download my data'. "
-         "It must have the sheets products, machines, and allowed.")
-
-if file is not None:
-    fid = getattr(file, "file_id", None) or f"{file.name}-{file.size}"
-    if st.session_state.last_upload != fid:
-        st.session_state.last_upload = fid
-        try:
-            set_src(read_workbook(file))
-        except Exception as e:
-            st.error(f"Could not read the file: {e}")
-
-st.download_button(
-    "Download example workbook (fill it in and upload it above)",
-    make_workbook(*example_data(), DEFAULT_SETTINGS, []),
-    file_name="planner_example.xlsx")
-
-# ---------- PARAMETERS (sidebar) ----------
-D = DEFAULT_SETTINGS
-st.sidebar.header("Parameters")
-
-st.sidebar.subheader("Scoring")
-on_time_points = st.sidebar.number_input(
-    "On-time points per unit", min_value=0, max_value=10000,
-    value=D["on_time_points"], step=10,
-    help="Score earned for each unit finished by its due day. "
-         "The planner looks for the plan with the highest total score.")
-late_points = st.sidebar.number_input(
-    "Late points per unit", min_value=0, max_value=10000,
-    value=D["late_points"], step=10,
-    help="Score for each unit finished after its due day. "
-         "Keep it below the on-time points so the planner prefers finishing on time.")
-earlier_bonus = st.sidebar.number_input(
-    "Points lost per day later", min_value=0, max_value=1000,
-    value=D["earlier_bonus"], step=1,
-    help="Points lost for every day a unit finishes later. "
-         "A small number makes the planner finish work early.")
-use_priority = st.sidebar.checkbox(
-    "Use order priority", value=D["use_priority"],
-    help="When on, each unit's score is multiplied by its order's priority, "
-         "so important orders are planned first.")
-if late_points > on_time_points:
-    st.sidebar.warning("Late points are higher than on-time points, so the planner "
-                       "will prefer finishing late.")
-
-st.sidebar.subheader("Rules")
-use_materials = st.sidebar.checkbox(
-    "Enforce material limits", value=D["use_materials"],
-    help="When on, the plan cannot use more material than table 5 lists for each day.")
-
-st.sidebar.subheader("Overtime")
-max_overtime = st.sidebar.number_input(
-    "Max overtime per machine per day (minutes)", min_value=0, max_value=1000,
-    value=D["max_overtime"], step=10,
-    help="Extra minutes each machine may run beyond table 2 on any day. 0 means no overtime.")
-overtime_cost = st.sidebar.number_input(
-    "Overtime cost (points per minute)", min_value=0, max_value=1000,
-    value=D["overtime_cost"], step=1,
-    help="Points lost for each overtime minute. Overtime is only used when "
-         "finishing on time is worth more than this cost.")
-
-st.sidebar.subheader("Solver")
-time_limit = st.sidebar.number_input(
-    "Time limit (seconds)", min_value=1, max_value=30,
-    value=min(D["time_limit_seconds"], 30), step=1,
-    help="How long the planner may search for a better plan. "
-         "10 seconds is enough for small problems.")
-
-settings = {
-    "on_time_points": int(on_time_points),
-    "late_points": int(late_points),
-    "earlier_bonus": int(earlier_bonus),
-    "use_priority": bool(use_priority),
-    "use_materials": bool(use_materials),
-    "max_overtime": int(max_overtime),
-    "overtime_cost": int(overtime_cost),
-    "time_limit_seconds": int(time_limit),
+# ---------------- data tab ----------------
+CFG = {
+    "orders": {
+        "order_id": st.column_config.TextColumn("Order / PO", help="Your PO or project number. Must be unique.", required=True),
+        "product_type": st.column_config.TextColumn("Product type", help="Must match a product type in Routing."),
+        "quantity": st.column_config.NumberColumn("Units", help="Units built as one project (for example 3 escalators).", min_value=0),
+        "due_date": st.column_config.DateColumn("Due / site date", help="Date the order must be finished."),
+        "priority": st.column_config.NumberColumn("Priority", help="1 to 10. Higher = more important.", min_value=1, max_value=10),
+        "start_not_before": st.column_config.DateColumn("Earliest start", help="Do not start before this date. Blank = plan start."),
+        "status": st.column_config.TextColumn("Status", help="For example Confirmed or Tentative. Use the filter in the Plan tab."),
+    },
+    "routing": {
+        "product_type": st.column_config.TextColumn("Product type", help="Name used in Orders."),
+        "step_no": st.column_config.NumberColumn("Step no.", help="Order of the step: 1, 2, 3 ...", min_value=1),
+        "step_name": st.column_config.TextColumn("Step", help="Frame, Welding, Paint, Assembly, Test ..."),
+        "fixed_hours": st.column_config.NumberColumn("Fixed hours", help="Hours needed regardless of quantity (setup).", min_value=0),
+        "hours_per_unit": st.column_config.NumberColumn("Hours per unit", help="Extra hours for each unit.", min_value=0),
+        "resources": st.column_config.TextColumn("Allowed crews / machines", help="Names from the Crews tab, separated by commas. The planner picks one."),
+    },
+    "resources": {
+        "resource": st.column_config.TextColumn("Crew / machine", help="Name used in Routing."),
+        "crew_size": st.column_config.NumberColumn("Crew size", help="People working together (1 for a machine).", min_value=0),
+        "hours_per_shift": st.column_config.NumberColumn("Hours per shift", help="Hours each person works per day.", min_value=0),
+        "efficiency_pct": st.column_config.NumberColumn("Efficiency %", help="100 = normal. 85 = slower crew.", min_value=0),
+        "work_days": st.column_config.TextColumn("Work days", help="For example Mon,Tue,Wed,Thu,Fri or Mon-Sat."),
+    },
+    "exceptions": {
+        "resource": st.column_config.TextColumn("Crew / machine", help="A name from Crews, or ALL for everyone (public holiday)."),
+        "from_date": st.column_config.DateColumn("From", help="First day."),
+        "to_date": st.column_config.DateColumn("To", help="Last day (blank = same as From)."),
+        "crew_available": st.column_config.NumberColumn("People available", help="0 = closed. 2 = two people present.", min_value=0),
+        "note": st.column_config.TextColumn("Note", help="Holiday, vacation, maintenance ..."),
+    },
+    "parts": {
+        "order_id": st.column_config.TextColumn("Order / PO", help="Order the part belongs to."),
+        "part": st.column_config.TextColumn("Part", help="Description."),
+        "needed_for_step": st.column_config.NumberColumn("Needed for step no.", help="The step cannot start before the arrival date.", min_value=1),
+        "arrival_date": st.column_config.DateColumn("Arrival date", help="Date the part arrives."),
+    },
 }
-
-# ---------- EDITABLE TABLES ----------
-prod0, mach0, allowed0, usage0, stock0 = st.session_state.src
-v = st.session_state.ver
-
-
-def num_col(label, help=None):
-    return st.column_config.NumberColumn(label, min_value=0, step=1, format="%d", help=help)
+NUM = {"quantity", "priority", "step_no", "fixed_hours", "hours_per_unit", "crew_size",
+       "hours_per_shift", "efficiency_pct", "crew_available", "needed_for_step"}
+DATE = {"due_date", "start_not_before", "from_date", "to_date", "arrival_date"}
 
 
-def names(df, col):
-    return sorted({str(x).strip() for x in df[col].dropna() if str(x).strip()})
-
-
-st.subheader("1. Orders")
-st.caption("One row per product: quantity, the day it is due (1 = first day), "
-           "priority (higher = more important), and minutes to make one unit.")
-prod = st.data_editor(
-    prod0, num_rows="dynamic", key=f"prod_{v}", hide_index=True,
-    column_config={
-        "product": st.column_config.TextColumn(
-            "Product",
-            help="Name of the product or order line. Each name must be unique, "
-                 "for example Chair or PO-1001 | Escalator 30."),
-        "demand": num_col(
-            "Quantity ordered",
-            "How many units were ordered. Whole number."),
-        "due_day": num_col(
-            "Due day",
-            "Day number the order is due. Day 1 is the first day in table 2. "
-            "Units finished after this day count as late."),
-        "priority": num_col(
-            "Priority",
-            "How important the order is. A higher number means more important. "
-            "Used when capacity is short, if 'Use order priority' is on."),
-        "minutes_per_unit": num_col(
-            "Minutes per unit",
-            "Machine minutes needed to make one unit."),
-    })
-product_names = names(prod, "product")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("2. Machine minutes per day")
-    st.caption("One row per machine and day.")
-    mach = st.data_editor(
-        mach0, num_rows="dynamic", key=f"mach_{v}", hide_index=True,
-        column_config={
-            "machine": st.column_config.TextColumn(
-                "Machine",
-                help="Name of the machine, line, or team. Spell it the same way everywhere."),
-            "day": num_col(
-                "Day",
-                "Day number, starting at 1. These are the days the planner can use."),
-            "minutes_available": num_col(
-                "Minutes available",
-                "Minutes this machine can run on this day (480 = 8 hours). "
-                "Use 0 for a day the machine is down."),
-        })
-machine_names = names(mach, "machine")
-
-with col2:
-    st.subheader("3. Which machine can make which product")
-    st.caption("Pick from the products and machines you entered.")
-    allowed_cfg = {}
-    if product_names:
-        allowed_cfg["product"] = st.column_config.SelectboxColumn(
-            "Product", options=product_names,
-            help="A product from table 1. Pick it from the list.")
-    if machine_names:
-        allowed_cfg["machine"] = st.column_config.SelectboxColumn(
-            "Machine", options=machine_names,
-            help="A machine from table 2 that can make this product. "
-                 "Add one row for each allowed machine.")
-    allowed = st.data_editor(allowed0, num_rows="dynamic", key=f"allowed_{v}",
-                             hide_index=True, column_config=allowed_cfg)
-
-col3, col4 = st.columns(2)
-with col3:
-    st.subheader("4. Material used per unit (whole kg)")
-    usage_cfg = {
-        "material": st.column_config.TextColumn(
-            "Material",
-            help="Name of the material, for example Steel. "
-                 "Spell it exactly the same way in table 5."),
-        "kg_per_unit": num_col(
-            "Kg per unit",
-            "Kilograms of this material used to make one unit. Whole number."),
-    }
-    if product_names:
-        usage_cfg["product"] = st.column_config.SelectboxColumn(
-            "Product", options=product_names,
-            help="A product from table 1 that uses this material.")
-    usage_df = st.data_editor(usage0, num_rows="dynamic", key=f"usage_{v}",
-                              hide_index=True, column_config=usage_cfg)
-with col4:
-    st.subheader("5. Material available per day (kg)")
-    stock_df = st.data_editor(
-        stock0, num_rows="dynamic", key=f"stock_{v}", hide_index=True,
-        column_config={
-            "material": st.column_config.TextColumn(
-                "Material",
-                help="Material name, spelled exactly as in table 4."),
-            "day": num_col(
-                "Day",
-                "Day this material is available. Uses the same day numbers as table 2."),
-            "kg_available": num_col(
-                "Kg available",
-                "Kilograms available on that day. Each day is planned separately, "
-                "so unused material does not carry over."),
-        })
-
-d1, d2 = st.columns([1, 3])
-d1.download_button(
-    "Download my data",
-    make_workbook(prod, mach, allowed, usage_df, stock_df, settings, st.session_state.runs),
-    file_name="planner_data.xlsx")
-d2.caption("The workbook has your tables, parameters, and plans. Upload it later to continue.")
-
-# ---------- IMPORT FROM YOUR OWN SYSTEM ----------
-with st.expander("Import from your own scheduling file (Excel or CSV)"):
-    importer.render_import(set_src)
-
-plan_name = st.text_input(
-    "Plan name (optional, helps you find it later)", value="",
-    help="A label for this plan, such as 'With overtime'. "
-         "It appears in the plans list and in comparisons.")
-
-# ---------- RUN ----------
-if st.button("Make plan", type="primary",
-             help="Checks your tables and parameters, then builds the plan."):
-    st.session_state.last = None
-    msgs = []
-    try:
-        products, machines, days, capacity, usage, stock, notes = build_inputs(
-            prod, mach, allowed, usage_df, stock_df, settings["use_materials"])
-    except (ValueError, KeyError, TypeError) as e:
-        errs = e.args[0] if e.args and isinstance(e.args[0], list) else [str(e)]
-        msgs = [("error", m) for m in errs]
-    else:
-        msgs = [("warning", n) for n in notes]
-        plan_rows, summary_rows, material_rows, overtime_rows = make_plan(
-            products, machines, days, capacity, usage, stock, settings=settings)
-
-        if plan_rows is None:
-            msgs.append(("error", "No plan found. Try a longer time limit or check your data."))
-        elif not plan_rows:
-            msgs.append(("warning", "Nothing can be made with this data. "
-                                    "Check capacity, quantities, and allowed machines."))
+def for_editor(df):
+    df = df.copy()
+    for c in df.columns:
+        if c in DATE:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+        elif c in NUM:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
         else:
-            plan = pd.DataFrame(plan_rows)
-            summary = pd.DataFrame(summary_rows)
-            late_total = int(summary["late"].sum())
-            not_made_total = int((summary["ordered"] - summary["made"]).sum())
-            total_overtime = int(sum(r["overtime_minutes"] for r in overtime_rows))
-
-            rid = st.session_state.next_id
-            st.session_state.next_id += 1
-            name = plan_name.strip() or "Untitled"
-            st.session_state.runs.append({
-                "id": rid, "name": name, "settings": dict(settings),
-                "late_units": late_total, "units_not_made": not_made_total,
-                "overtime_minutes": total_overtime, "plan": plan,
-            })
-            st.session_state.last = {
-                "id": rid, "name": name, "settings": dict(settings),
-                "days": days, "machines": machines,
-                "summary": summary, "plan": plan,
-                "material_rows": material_rows, "overtime_rows": overtime_rows,
-                "late_units": late_total, "units_not_made": not_made_total,
-                "overtime_minutes": total_overtime,
-            }
-    st.session_state.msgs = msgs
-
-for level, text in st.session_state.msgs:
-    getattr(st, level)(text)
+            df[c] = df[c].astype("object").where(df[c].notna(), None)
+    return df
 
 
-def show_result(r):
-    st.success(f"Plan #{r['id']} ({r['name']}) added to this session's plans below.")
-    st.caption(f"Days: {r['days']}. Machines: {r['machines']}.")
-    st.caption("Parameters used: " + ", ".join(f"{k} = {v}" for k, v in r["settings"].items()))
-
-    st.subheader("Result per product")
-    st.dataframe(r["summary"], hide_index=True)
-
-    po = po_summary(r["summary"], r["plan"])
-    if po is not None:
-        st.subheader("Result per PO")
-        st.dataframe(po, hide_index=True)
-
+with tab_data:
     c1, c2, c3 = st.columns(3)
-    c1.metric("Late units", r["late_units"])
-    c2.metric("Units not made", r["units_not_made"])
-    c3.metric("Overtime minutes", r["overtime_minutes"])
+    if c1.button("Load escalator example"):
+        set_tables(tables.example())
+        st.rerun()
+    if c2.button("Start blank"):
+        set_tables(tables.blank())
+        st.rerun()
+    up = c3.file_uploader("Load a saved workbook", type=["xlsx"], key=f"wb_{st.session_state['ver']}",
+                          label_visibility="collapsed")
+    if up is not None:
+        try:
+            set_tables(tables.from_workbook(up))
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not read the workbook: {e}")
 
-    st.subheader("Plan")
-    st.dataframe(r["plan"], hide_index=True)
+    with st.expander("Import orders from your own schedule file"):
+        def done(orders):
+            set_tables({"orders": orders}, keep_others=True)
+            st.session_state["import_note"] = f"{len(orders)} orders imported."
+        importer.render_import(done)
+    if st.session_state.get("import_note"):
+        st.success(st.session_state.pop("import_note") + " Check the Routing tab has a route for each product type.")
+        orders_now = st.session_state["base"]["orders"]
+        known = set(st.session_state["base"]["routing"]["product_type"].astype(str))
+        missing = sorted(set(orders_now["product_type"].astype(str)) - known - {""})
+        if missing:
+            st.warning("No routing yet for: " + ", ".join(missing))
 
-    if r["overtime_rows"]:
-        st.subheader("Overtime used")
-        st.dataframe(pd.DataFrame(r["overtime_rows"]), hide_index=True)
+    sub = st.tabs([tables.TITLES[k] for k in tables.COLUMNS])
+    for tab, name in zip(sub, tables.COLUMNS):
+        with tab:
+            st.session_state["edited"][name] = st.data_editor(
+                for_editor(st.session_state["base"][name]), num_rows="dynamic", width="stretch",
+                column_config=CFG[name], key=f"ed_{name}_{st.session_state['ver']}", hide_index=True)
 
-    if r["material_rows"]:
-        st.subheader("Material used vs available")
-        st.dataframe(pd.DataFrame(r["material_rows"]), hide_index=True)
+    st.download_button("Download data as Excel", tables.to_workbook(current_tables()), file_name="planner_data.xlsx")
+    with st.form("save_ds", clear_on_submit=True):
+        nm = st.text_input("Save this data set in my account as")
+        if st.form_submit_button("Save data set") and nm.strip():
+            store.save_item("datasets", uid, nm.strip(), tables.to_json(current_tables()), eng)
+            st.success("Saved.")
 
-    st.subheader("Units per day by machine")
-    st.bar_chart(r["plan"].pivot_table(index="day", columns="machine",
-                                       values="qty", aggfunc="sum").fillna(0))
+# ---------------- plan tab ----------------
+def result_to_json(res, settings, status_note):
+    def conv(rows):
+        return [{k: (v.isoformat() if isinstance(v, date) else v) for k, v in r.items()} for r in rows]
+    return {"orders": conv(res["orders"]), "steps": conv(res["steps"]), "load": conv(res["load"]),
+            "settings": {k: (v if not isinstance(v, date) else v.isoformat()) for k, v in settings.items()},
+            "status": status_note}
 
-    buffer = io.BytesIO()
-    r["plan"].to_excel(buffer, index=False)
-    st.download_button("Download this plan as Excel", buffer.getvalue(),
-                       file_name=f"plan_{r['id']}.xlsx")
+
+def plan_excel(res):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame(res["orders"]).to_excel(xw, sheet_name="orders", index=False)
+        pd.DataFrame(res["steps"]).to_excel(xw, sheet_name="steps", index=False)
+        pd.DataFrame(res["daily"]).to_excel(xw, sheet_name="daily_hours", index=False)
+        pd.DataFrame(res["load"]).to_excel(xw, sheet_name="resource_load", index=False)
+    return buf.getvalue()
 
 
-if st.session_state.last:
-    show_result(st.session_state.last)
-
-# ---------- PLANS FROM THIS SESSION ----------
-st.divider()
-st.header("Plans from this session")
-
-if "flash" in st.session_state:
-    st.success(st.session_state.pop("flash"))
-
-runs = st.session_state.runs
-
-if not runs:
-    st.write("No plans yet. Click **Make plan** to create the first one.")
-else:
-    latest = {}
-    for f in st.session_state.feedback:
-        latest[f["plan"]] = f["decision"]
-
-    st.dataframe(pd.DataFrame([{
-        "plan": r["id"], "name": r["name"], "late units": r["late_units"],
-        "units not made": r["units_not_made"], "overtime minutes": r["overtime_minutes"],
-        "decision": latest.get(r["id"], "Not reviewed"),
-    } for r in reversed(runs)]), hide_index=True)
-
-    labels = {r["id"]: f"#{r['id']} {r['name']}" for r in runs}
-    ids = [r["id"] for r in reversed(runs)]  # newest first
-    by_id = {r["id"]: r for r in runs}
-
-    # ----- planner feedback -----
-    st.subheader("Planner feedback")
-    st.write("Did the planner use this plan? If they changed it, write what they changed and why.")
-
-    fb_id = st.selectbox("Plan to review", ids, index=0, format_func=lambda i: labels[i],
-                         help="The plan this feedback is about.")
-    decision = st.radio("Decision", ["Accepted as is", "Changed by planner", "Rejected"],
-                        horizontal=True,
-                        help="Accepted: used without changes. Changed: used after edits. "
-                             "Rejected: not used.")
-    reason = st.text_area("Reason (what was wrong, or what was changed)",
-                          help="Required for Changed and Rejected. Repeated reasons show "
-                               "which rule to add to the planner next.")
-
-    if st.button("Save feedback"):
-        if decision != "Accepted as is" and not reason.strip():
-            st.warning("Please write a short reason. It tells you which rule to add next.")
+with tab_plan:
+    data = current_tables()
+    statuses = sorted({str(s).strip() for s in data["orders"]["status"].dropna() if str(s).strip()})
+    chosen = statuses
+    if statuses:
+        chosen = st.multiselect("Plan orders with these statuses", statuses, default=statuses,
+                                help="Untick a status (for example Tentative) to leave those orders out.")
+    if st.button("Make plan", type="primary"):
+        d = dict(data)
+        o = d["orders"]
+        if statuses:
+            blank_ok = o["status"].isna() | (o["status"].astype(str).str.strip() == "")
+            d["orders"] = o[blank_ok | o["status"].astype(str).str.strip().isin(chosen)]
+        jobs, cap, days, problems, skipped = tables.prepare(d, plan_start, S)
+        for p in problems:
+            st.warning(p)
+        if skipped:
+            st.warning("Left out of the plan:")
+            st.dataframe(pd.DataFrame(skipped), hide_index=True)
+        if not jobs:
+            st.error("There are no valid orders to plan.")
         else:
-            st.session_state.feedback.append({
-                "plan": fb_id, "name": by_id[fb_id]["name"],
-                "decision": decision, "reason": reason.strip(),
-            })
-            st.session_state["flash"] = f"Feedback saved for plan #{fb_id}."
+            with st.spinner("Planning ..."):
+                res = scheduler.solve(jobs, cap, days, S)
+            if res["status"] == "none":
+                st.error("No plan found. Try more solver time or more days.")
+            else:
+                st.session_state["result"] = res
+                st.session_state["result_meta"] = {"start": plan_start, "S": dict(S), "n": len(jobs)}
+
+    res = st.session_state.get("result")
+    if res:
+        meta = st.session_state["result_meta"]
+        orders = pd.DataFrame(res["orders"])
+        load = pd.DataFrame(res["load"])
+        late = int((orders["status"] == "Late").sum())
+        notp = int((orders["status"] == "Not scheduled").sum())
+        ot_hours = int(load["overtime"].sum()) if len(load) else 0
+        delivered = int(orders["status"].isin(["On time", "Late"]).sum())
+        if "focus" not in st.session_state:
+            st.session_state["focus"] = "All orders"
+        cards = [("Orders delivered", delivered, "Delivered", "On time + late"),
+                 ("Orders on time", int((orders["status"] == "On time").sum()), "On time", None),
+                 ("Late orders", late, "Late", None),
+                 ("Not scheduled", notp, "Not scheduled", None),
+                 ("Overtime hours", ot_hours, "Overtime", None)]
+        for col, (label, value, key, hint) in zip(st.columns(5), cards):
+            col.metric(label, value, help=hint)
+            if col.button("Show list", key=f"focus_{key}", type="primary" if st.session_state["focus"] == key else "secondary"):
+                st.session_state["focus"] = key
+                st.rerun()
+        if res["status"] == "feasible":
+            st.caption("Good plan found within the time limit. More solver time may improve it.")
+        if notp:
+            st.warning("Some orders do not fit in the days planned. Add capacity, add days, or move due dates.")
+
+        due = data["orders"].assign(order_id=data["orders"]["order_id"].astype(str).str.strip())[
+            ["order_id", "product_type", "quantity", "due_date", "priority"]]
+        due["due_date"] = pd.to_datetime(due["due_date"], errors="coerce").dt.date
+        show = orders.merge(due, on="order_id", how="left")
+        show = show[["order_id", "product_type", "quantity", "status", "finish", "due_date", "days_late", "priority"]]
+        focus = st.session_state["focus"]
+        head, allbtn = st.columns([5, 1])
+        titles = {"All orders": "Result per order", "Delivered": "Orders that will be delivered",
+                  "On time": "Orders on time", "Late": "Late orders",
+                  "Not scheduled": "Orders not scheduled", "Overtime": "Overtime by crew and day"}
+        head.subheader(titles[focus])
+        if focus != "All orders" and allbtn.button("Show all orders"):
+            st.session_state["focus"] = "All orders"
+            st.rerun()
+        if focus == "Overtime":
+            ot_rows = load[load["overtime"] > 0] if len(load) else load
+            if len(ot_rows):
+                st.dataframe(ot_rows[["resource", "date", "capacity", "planned", "overtime"]],
+                             hide_index=True, width="stretch")
+            else:
+                st.info("No overtime in this plan. Raise 'Max overtime hours per day' in the sidebar to allow it.")
+        else:
+            if focus == "Delivered":
+                view_df = show[show["status"].isin(["On time", "Late"])]
+            elif focus in ("On time", "Late", "Not scheduled"):
+                view_df = show[show["status"] == focus]
+            else:
+                view_df = show
+            if len(view_df):
+                st.dataframe(view_df, hide_index=True, width="stretch")
+            else:
+                st.info("No orders in this group.")
+
+        steps = pd.DataFrame(res["steps"])
+        if len(steps):
+            st.subheader("Schedule")
+            view = st.radio("Show by", ["Order", "Crew / machine"], horizontal=True)
+            g = steps.copy()
+            g["start"] = pd.to_datetime(g["start"])
+            g["end"] = pd.to_datetime(g["end"]) + pd.Timedelta(days=1)
+            if view == "Order":
+                ch = alt.Chart(g).mark_bar().encode(
+                    x=alt.X("start:T", title=None), x2="end:T", y=alt.Y("order_id:N", title=None),
+                    color=alt.Color("step_name:N", title="Step"),
+                    tooltip=["order_id", "step_name", "resource", "start", "end", "hours"])
+            else:
+                ch = alt.Chart(g).mark_bar().encode(
+                    x=alt.X("start:T", title=None), x2="end:T", y=alt.Y("resource:N", title=None),
+                    color=alt.Color("order_id:N", title="Order"),
+                    tooltip=["order_id", "step_name", "resource", "start", "end", "hours"])
+            st.altair_chart(ch.properties(height=max(200, 34 * g[("order_id" if view == "Order" else "resource")].nunique())),
+                            width="stretch")
+            st.dataframe(steps, hide_index=True, width="stretch")
+
+        if len(load):
+            st.subheader("Crew and machine load")
+            l2 = load[load["capacity"] > 0].copy()
+            l2["date"] = pd.to_datetime(l2["date"])
+            l2["used_pct"] = (100 * l2["planned"] / l2["capacity"]).round()
+            heat = alt.Chart(l2).mark_rect().encode(
+                x=alt.X("date:T", title=None), y=alt.Y("resource:N", title=None),
+                color=alt.Color("used_pct:Q", title="% used", scale=alt.Scale(domain=[0, 100], scheme="blues")),
+                tooltip=["resource", "date", "planned", "capacity", "overtime"])
+            st.altair_chart(heat.properties(height=40 * l2["resource"].nunique() + 40), width="stretch")
+
+        st.download_button("Download plan as Excel", plan_excel(res), file_name="plan.xlsx")
+        with st.form("save_plan", clear_on_submit=True):
+            nm = st.text_input("Save this plan in my account as")
+            if st.form_submit_button("Save plan") and nm.strip():
+                store.save_item("plans", uid, nm.strip(), result_to_json(res, {**meta["S"], "start": meta["start"]}, res["status"]), eng)
+                st.success("Saved.")
+
+# ---------------- saved tab ----------------
+with tab_saved:
+    st.subheader("My data sets")
+    for it in store.list_items("datasets", uid, eng):
+        a, b, c = st.columns([4, 1, 1])
+        a.write(f"{it['name']}  \n:gray[{it['created']}]")
+        if b.button("Load", key=f"ld{it['id']}"):
+            set_tables(tables.from_json(store.load_item("datasets", uid, it["id"], eng)))
+            st.rerun()
+        if c.button("Delete", key=f"dd{it['id']}"):
+            store.delete_item("datasets", uid, it["id"], eng)
             st.rerun()
 
-    if st.session_state.feedback:
-        st.write("**Feedback log**")
-        st.dataframe(pd.DataFrame(list(reversed(st.session_state.feedback))),
-                     hide_index=True)
+    st.subheader("My saved plans")
+    plans = store.list_items("plans", uid, eng)
+    rows = []
+    for it in plans:
+        body = store.load_item("plans", uid, it["id"], eng) or {}
+        o = pd.DataFrame(body.get("orders", []))
+        ld = pd.DataFrame(body.get("load", []))
+        rows.append({"id": it["id"], "name": it["name"], "saved": it["created"],
+                     "on time": int((o["status"] == "On time").sum()) if len(o) else 0,
+                     "late": int((o["status"] == "Late").sum()) if len(o) else 0,
+                     "not scheduled": int((o["status"] == "Not scheduled").sum()) if len(o) else 0,
+                     "late days": int(o["days_late"].fillna(0).sum()) if len(o) else 0,
+                     "overtime h": int(ld["overtime"].sum()) if len(ld) else 0})
+    if rows:
+        st.caption("Compare saved plans side by side:")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        pick = st.selectbox("Open or delete a plan", [r["id"] for r in rows],
+                            format_func=lambda i: next(r["name"] for r in rows if r["id"] == i))
+        body = store.load_item("plans", uid, pick, eng)
+        if body:
+            st.dataframe(pd.DataFrame(body["orders"]), hide_index=True, width="stretch")
+        if st.button("Delete this plan"):
+            store.delete_item("plans", uid, pick, eng)
+            st.rerun()
+    else:
+        st.write("No saved plans yet.")
 
-    # ----- compare two plans -----
-    if len(runs) >= 2:
-        st.subheader("Compare two plans")
-        pick1, pick2 = st.columns(2)
-        old_id = pick1.selectbox("Older plan", ids, index=1, format_func=lambda i: labels[i],
-                                 help="The plan to compare against.")
-        new_id = pick2.selectbox("Newer plan", ids, index=0, format_func=lambda i: labels[i],
-                                 help="The plan whose changes you want to see.")
-        old, new = by_id[old_id], by_id[new_id]
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Late units", new["late_units"],
-                  delta=new["late_units"] - old["late_units"], delta_color="inverse")
-        m2.metric("Units not made", new["units_not_made"],
-                  delta=new["units_not_made"] - old["units_not_made"], delta_color="inverse")
-        m3.metric("Overtime minutes", new["overtime_minutes"],
-                  delta=new["overtime_minutes"] - old["overtime_minutes"], delta_color="inverse")
-
-        a = old["plan"].rename(columns={"qty": "qty_older"})
-        b = new["plan"].rename(columns={"qty": "qty_newer"})
-        diff = a.merge(b, on=["day", "product", "machine"], how="outer").fillna(0)
-        diff["change"] = diff["qty_newer"] - diff["qty_older"]
-        diff = diff[diff["change"] != 0].sort_values(["day", "product", "machine"])
-
-        st.write("**What changed in the schedule** (only rows that differ):")
-        if diff.empty:
-            st.write("The two plans are identical.")
-        else:
-            st.dataframe(diff.astype({"qty_older": int, "qty_newer": int, "change": int}),
-                         hide_index=True)
+    st.subheader("Feedback")
+    with st.form("fb", clear_on_submit=True):
+        txt = st.text_area("What worked, what is missing, what was wrong?")
+        if st.form_submit_button("Send feedback") and txt.strip():
+            store.save_item("feedback", uid, txt.strip()[:60], {"text": txt.strip()}, eng)
+            st.success("Thank you.")
+    for it in store.list_items("feedback", uid, eng)[:20]:
+        body = store.load_item("feedback", uid, it["id"], eng) or {}
+        st.write(f":gray[{it['created']}] {body.get('text', '')}")
