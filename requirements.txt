@@ -5,3 +5,4 @@ ortools
 sqlalchemy
 psycopg2-binary
 altair
+reportlab

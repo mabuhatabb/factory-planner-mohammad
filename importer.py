@@ -17,6 +17,7 @@ FIELDS = {
     "priority": ("Priority", ["priority", "rank", "importance"], False),
     "start_not_before": ("Earliest start", ["release", "earliest", "start", "kickoff"], False),
     "status": ("Status", ["status", "state", "stage"], False),
+    "order_value": ("Order value", ["value", "amount", "price", "revenue", "contract"], False),
 }
 
 
@@ -106,6 +107,7 @@ def build_orders(frames, mapping, status_col_values=None, default_priority=1, de
             row["order_id"] = tables._text(row["order_id"])
             row["product_type"] = tables._text(row["product_type"])
             row["status"] = st_val
+            row["order_value"] = tables._num(row["order_value"], None)
             rows.append(row)
     return pd.DataFrame(rows, columns=tables.ORDERS)
 

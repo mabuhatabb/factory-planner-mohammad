@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-ORDERS = ["order_id", "product_type", "quantity", "due_date", "priority", "start_not_before", "status"]
+ORDERS = ["order_id", "product_type", "quantity", "due_date", "priority", "start_not_before", "status", "order_value"]
 ROUTING = ["product_type", "step_no", "step_name", "fixed_hours", "hours_per_unit", "resources"]
 RESOURCES = ["resource", "crew_size", "hours_per_shift", "efficiency_pct", "work_days"]
 EXCEPTIONS = ["resource", "from_date", "to_date", "crew_available", "note"]
@@ -28,11 +28,11 @@ def example(today=None):
     monday = t - timedelta(days=t.weekday())
     d = lambda n: monday + timedelta(days=n)
     orders = pd.DataFrame([
-        ["PO-1001", "Escalator 30deg", 2, d(35), 3, d(0), "Confirmed"],
-        ["PO-1002", "Escalator 30deg", 3, d(49), 2, d(7), "Confirmed"],
-        ["PO-1003", "Moving walk", 2, d(42), 1, d(0), "Confirmed"],
-        ["PO-1004", "Escalator 35deg", 1, d(28), 3, d(0), "Confirmed"],
-        ["PO-1005", "Escalator 30deg", 4, d(70), 1, d(14), "Tentative"],
+        ["PO-1001", "Escalator 30deg", 2, d(35), 3, d(0), "Confirmed", 850000],
+        ["PO-1002", "Escalator 30deg", 3, d(49), 2, d(7), "Confirmed", 1200000],
+        ["PO-1003", "Moving walk", 2, d(42), 1, d(0), "Confirmed", 420000],
+        ["PO-1004", "Escalator 35deg", 1, d(28), 3, d(0), "Confirmed", 380000],
+        ["PO-1005", "Escalator 30deg", 4, d(70), 1, d(14), "Tentative", 1500000],
     ], columns=ORDERS)
     esc = [("Frame", 16, 24, "Frame crew"), ("Welding", 8, 16, "Weld crew A, Weld crew B"),
            ("Paint", 4, 8, "Paint booth"), ("Assembly", 16, 28, "Assembly crew"),
