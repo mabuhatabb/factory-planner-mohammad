@@ -167,7 +167,7 @@ def login_screen():
                     st.success("If that account exists and has an email address, a reset link is on its way. "
                                "No email? Ask your admin to reset your password in the Team tab.")
     with tab_up:
-        code_needed = store.is_hosted(eng) and invite_code()
+        code_needed = bool(invite_code())
         if store.is_hosted(eng) and not invite_code():
             st.info("Sign-up is closed: the owner has not set an invite code.")
         else:
