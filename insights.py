@@ -130,3 +130,61 @@ def drift(old_orders, new_orders):
         if oid not in new:
             changes.append({"order_id": oid, "change": "Order removed or no longer planned", "was": old[oid]["status"], "now": "-"})
     return changes
+
+
+# ---------- plan comparison and history ----------
+def plan_metrics(body):
+    o = pd.DataFrame(body.get("orders", []))
+    ld = pd.DataFrame(body.get("load", []))
+    n = len(o)
+    cnt = lambda s: int((o["status"] == s).sum()) if n else 0
+    return {"orders": n, "on_time": cnt("On time"), "late": cnt("Late"), "not_scheduled": cnt("Not scheduled"),
+            "late_days": int(o["days_late"].fillna(0).sum()) if n else 0,
+            "overtime_h": int(ld["overtime"].sum()) if len(ld) else 0,
+            "on_time_pct": round(100 * cnt("On time") / n, 1) if n else 0.0}
+
+
+def weekly_history(items):
+    """items: list of (saved_iso, metrics dict). One row per week, using the last plan saved that week."""
+    rows = []
+    for saved, m in items:
+        t = pd.to_datetime(saved)
+        rows.append({"week": (t - pd.Timedelta(days=t.weekday())).normalize(), "saved": t, **m})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("saved")
+    return df.groupby("week", as_index=False).last().drop(columns=["saved"])
+
+
+def compare_plans(a, b):
+    """Line-by-line comparison of two saved plans. Returns (orders_df, steps_df)."""
+    oa = {o["order_id"]: o for o in a.get("orders", [])}
+    ob = {o["order_id"]: o for o in b.get("orders", [])}
+    rows = []
+    for oid in list(dict.fromkeys(list(oa) + list(ob))):
+        x, y = oa.get(oid), ob.get(oid)
+        fa = str((x or {}).get("finish") or "-")[:10]
+        fb = str((y or {}).get("finish") or "-")[:10]
+        if x is None:
+            note = "Only in B"
+        elif y is None:
+            note = "Only in A"
+        elif fa == fb and x["status"] == y["status"]:
+            note = "Same"
+        else:
+            try:
+                dd = (pd.to_datetime(fb) - pd.to_datetime(fa)).days
+                note = f"Finishes {abs(dd)} days {'later' if dd > 0 else 'earlier'}" if dd else "Status changed"
+            except Exception:
+                note = "Changed"
+        rows.append({"order_id": oid, "status A": (x or {}).get("status", "-"), "finish A": fa,
+                     "status B": (y or {}).get("status", "-"), "finish B": fb, "change": note})
+    sa = {(r["order_id"], r["step_no"]): r for r in a.get("steps", [])}
+    sb = {(r["order_id"], r["step_no"]): r for r in b.get("steps", [])}
+    srows = []
+    for key in sorted(set(sa) | set(sb), key=lambda k: (str(k[0]), k[1])):
+        x, y = sa.get(key), sb.get(key)
+        fmt_ = lambda r: "-" if r is None else f"{r['resource']}: {str(r['start'])[:10]} to {str(r['end'])[:10]}"
+        if fmt_(x) != fmt_(y):
+            srows.append({"order_id": key[0], "step_no": key[1], "step": (x or y)["step_name"], "A": fmt_(x), "B": fmt_(y)})
+    return pd.DataFrame(rows), pd.DataFrame(srows)

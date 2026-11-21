@@ -25,6 +25,7 @@ DEFAULT_SETTINGS = {
     "max_overtime": 0,         # extra hours per resource per working day
     "overtime_cost": 5,        # points lost per overtime hour
     "time_limit_seconds": 20,  # how long the solver may search
+    "shift_start_hour": 8,     # clock hour the working day starts (used for hour-by-hour times)
 }
 
 
@@ -57,17 +58,26 @@ def _solve_model(jobs, cap, days, settings=None):
     used = {}         # (j, k, d) -> bool: any work on that day
     finish = {}       # (j, k) -> last day index with work
     by_rd = {}        # (r, d) -> list of x vars
+    by_rdp = {}       # (r, d) -> {product type: list of x vars}  (for changeover time)
+    begun = {}        # (j, k) -> {day: bool "step has started by this day"}  (for materials)
     day_vars = {}     # (j, k) -> list of day indexes that exist
 
+    step_res = {}     # (j, k) -> resources this step may use (one only when locked)
     for j, job in enumerate(jobs):
         inc[j] = model.NewBoolVar(f"inc_{j}")
+        if any(st.get("lock") for st in job["steps"]):
+            model.Add(inc[j] == 1)           # an order with a locked step must be planned
         for k, step in enumerate(job["steps"]):
             hours = int(step["hours"])
             earliest = max(0, int(step["earliest"]))
+            lock = step.get("lock")
+            step_res[j, k] = [lock["resource"]] if lock else list(step["resources"])
+            last_day = horizon - 1 if not lock else min(horizon - 1, int(lock["end"]))
+            first_day = earliest if not lock else max(earliest, int(lock["start"]))
             options = []
-            for r in step["resources"]:
+            for r in step_res[j, k]:
                 avail = []
-                for d in range(earliest, horizon):
+                for d in range(first_day, last_day + 1):
                     c = cap[r][d]
                     if c <= 0:
                         continue
@@ -75,6 +85,7 @@ def _solve_model(jobs, cap, days, settings=None):
                     if ub > 0:
                         x[j, k, r, d] = model.NewIntVar(0, ub, f"x_{j}_{k}_{r}_{d}")
                         by_rd.setdefault((r, d), []).append(x[j, k, r, d])
+                        by_rdp.setdefault((r, d), {}).setdefault(job.get("product", ""), []).append(x[j, k, r, d])
                         avail.append(d)
                 a = model.NewBoolVar(f"a_{j}_{k}_{r}")
                 assign[j, k, r] = a
@@ -89,7 +100,7 @@ def _solve_model(jobs, cap, days, settings=None):
             day_vars[j, k] = dlist
             finish[j, k] = model.NewIntVar(0, horizon - 1, f"fin_{j}_{k}")
             for d in dlist:
-                total = sum(x[j, k, r, d] for r in step["resources"] if (j, k, r, d) in x)
+                total = sum(x[j, k, r, d] for r in step_res[j, k] if (j, k, r, d) in x)
                 u = model.NewBoolVar(f"u_{j}_{k}_{d}")
                 used[j, k, d] = u
                 model.Add(total >= 1).OnlyEnforceIf(u)
@@ -97,16 +108,59 @@ def _solve_model(jobs, cap, days, settings=None):
                 model.Add(finish[j, k] >= d).OnlyEnforceIf(u)
                 if k > 0:
                     model.Add(finish[j, k - 1] + gap <= d).OnlyEnforceIf(u)
+            if lock and dlist:
+                model.Add(used[j, k, dlist[0]] == 1)
+                model.Add(used[j, k, dlist[-1]] == 1)
+            if step.get("materials"):
+                chain, prev = {}, None
+                for d in dlist:
+                    b = model.NewBoolVar(f"b_{j}_{k}_{d}")
+                    model.Add(b >= used[j, k, d])
+                    if prev is not None:
+                        model.Add(b >= prev)
+                    chain[d] = prev = b
+                begun[j, k] = chain
 
-    # capacity per resource and day (+ overtime)
+    # materials: what steps have started by a day may not use more than the stock that has arrived by then
+    supply = getattr(cap, "supply", {}) or {}
+    mats = {m for job in jobs for st in job["steps"] for m in (st.get("materials") or {})}
+    for m in mats:
+        users = [(j, k, int(jobs[j]["steps"][k]["materials"][m])) for (j, k) in begun
+                 if m in jobs[j]["steps"][k]["materials"]]
+        check_days = sorted({d for (j, k, q) in users for d in begun[j, k]})
+        have = supply.get(m, [0] * horizon)
+        for d in check_days:
+            terms = []
+            for j, k, q in users:
+                prior = [dd for dd in begun[j, k] if dd <= d]
+                if prior:
+                    terms.append(q * begun[j, k][max(prior)])
+            if terms:
+                model.Add(sum(terms) <= int(have[d]))
+
+    # capacity per resource and day (+ overtime), including changeover time when different products share a day
+    changeover = getattr(cap, "changeover", {}) or {}
     ot = {}
     for (r, d), terms in by_rd.items():
         base = cap[r][d]
+        h = int(changeover.get(r, 0) or 0)
+        prods = by_rdp.get((r, d), {})
+        extra = 0
+        if h > 0 and len(prods) > 1:
+            big = base + max_ot
+            zs = []
+            for pi, vs in enumerate(prods.values()):
+                z = model.NewBoolVar(f"z_{r}_{d}_{pi}")
+                model.Add(sum(vs) <= big * z)
+                zs.append(z)
+            sw = model.NewIntVar(0, len(zs) - 1, f"sw_{r}_{d}")
+            model.Add(sw >= sum(zs) - 1)
+            extra = h * sw
         if max_ot > 0:
             ot[r, d] = model.NewIntVar(0, max_ot, f"ot_{r}_{d}")
-            model.Add(sum(terms) <= base + ot[r, d])
+            model.Add(sum(terms) + extra <= base + ot[r, d])
         else:
-            model.Add(sum(terms) <= base)
+            model.Add(sum(terms) + extra <= base)
 
     # objective
     objective = []
@@ -173,7 +227,7 @@ def _solve_model(jobs, cap, days, settings=None):
         for k, step in enumerate(job["steps"]):
             if not planned:
                 continue
-            chosen = [r for r in step["resources"] if solver.Value(assign[j, k, r])]
+            chosen = [r for r in step_res[j, k] if solver.Value(assign[j, k, r])]
             dd = per_step.get((j, k), {})
             if not chosen or not dd:
                 continue
@@ -195,11 +249,17 @@ def _solve_model(jobs, cap, days, settings=None):
 
     load = []
     for r, caps in cap.items():
+        h = int(changeover.get(r, 0) or 0)
         for d in range(horizon):
             hours = sum(solver.Value(v) for v in by_rd.get((r, d), []))
+            setup = 0
+            if h > 0:
+                present = sum(1 for vs in by_rdp.get((r, d), {}).values() if sum(solver.Value(v) for v in vs) > 0)
+                setup = h * max(0, present - 1)
             if caps[d] > 0 or hours > 0:
                 load.append({"resource": r, "date": days[d], "capacity": int(caps[d]),
-                             "planned": int(hours), "overtime": int(max(0, hours - caps[d]))})
+                             "planned": int(hours + setup), "setup": int(setup),
+                             "overtime": int(max(0, hours + setup - caps[d]))})
 
     return {
         "status": "optimal" if status == cp_model.OPTIMAL else "feasible",
@@ -226,19 +286,26 @@ def solve(jobs, cap, days, settings=None):
         s.update(settings)
     horizon = len(days)
     max_ot = int(s["max_overtime"])
-    fits = [j for j in jobs if not _cannot_fit(j, cap, horizon, max_ot)]
-    impossible = [j for j in jobs if _cannot_fit(j, cap, horizon, max_ot)]
+    def locked(j):
+        return any(st.get("lock") for st in j["steps"])
+    fits = [j for j in jobs if locked(j) or not _cannot_fit(j, cap, horizon, max_ot)]
+    impossible = [j for j in jobs if not locked(j) and _cannot_fit(j, cap, horizon, max_ot)]
     if fits:
         res = _solve_model(fits, cap, days, s)
         if res["status"] == "none":
             return res
     else:
         res = {"status": "optimal", "orders": [], "steps": [], "daily": [],
-               "load": [{"resource": r, "date": days[d], "capacity": int(cap[r][d]), "planned": 0, "overtime": 0}
+               "load": [{"resource": r, "date": days[d], "capacity": int(cap[r][d]), "planned": 0, "setup": 0, "overtime": 0}
                         for r in cap for d in range(horizon) if cap[r][d] > 0]}
     for j in impossible:
         res["orders"].append({"order_id": j["order_id"], "finish": None, "days_late": None,
                               "status": "Not scheduled"})
     order_of = {j["order_id"]: i for i, j in enumerate(jobs)}
     res["orders"].sort(key=lambda o: order_of[o["order_id"]])
+    try:
+        import timing
+        timing.add_times(res, jobs, cap, days, s)
+    except Exception:
+        res.setdefault("blocks", [])
     return res

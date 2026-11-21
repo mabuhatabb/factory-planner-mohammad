@@ -6,15 +6,19 @@ from datetime import date, timedelta
 import pandas as pd
 
 ORDERS = ["order_id", "product_type", "quantity", "due_date", "priority", "start_not_before", "status", "order_value"]
-ROUTING = ["product_type", "step_no", "step_name", "fixed_hours", "hours_per_unit", "resources"]
-RESOURCES = ["resource", "crew_size", "hours_per_shift", "efficiency_pct", "work_days"]
+ROUTING = ["product_type", "step_no", "step_name", "fixed_hours", "hours_per_unit", "resources",
+           "skill_required", "materials"]
+RESOURCES = ["resource", "crew_size", "hours_per_shift", "efficiency_pct", "work_days",
+             "shifts_per_day", "changeover_hours", "skills"]
 EXCEPTIONS = ["resource", "from_date", "to_date", "crew_available", "note"]
 PARTS = ["order_id", "part", "needed_for_step", "arrival_date"]
+STOCK = ["material", "available_from", "quantity"]
 
 COLUMNS = {"orders": ORDERS, "routing": ROUTING, "resources": RESOURCES,
-           "exceptions": EXCEPTIONS, "parts": PARTS}
+           "exceptions": EXCEPTIONS, "parts": PARTS, "stock": STOCK}
 TITLES = {"orders": "Orders", "routing": "Routing", "resources": "Crews and machines",
-          "exceptions": "Calendar exceptions", "parts": "Parts arrival"}
+          "exceptions": "Calendar exceptions", "parts": "Parts arrival",
+          "stock": "Materials and stock"}
 
 DAYNAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -34,21 +38,23 @@ def example(today=None):
         ["PO-1004", "Escalator 35deg", 1, d(28), 3, d(0), "Confirmed", 380000],
         ["PO-1005", "Escalator 30deg", 4, d(70), 1, d(14), "Tentative", 1500000],
     ], columns=ORDERS)
-    esc = [("Frame", 16, 24, "Frame crew"), ("Welding", 8, 16, "Weld crew A, Weld crew B"),
-           ("Paint", 4, 8, "Paint booth"), ("Assembly", 16, 28, "Assembly crew"),
-           ("Test", 4, 6, "Test bay")]
+    esc = [("Frame", 16, 24, "Frame crew", "", "Steel profile:2"),
+           ("Welding", 8, 16, "Weld crew A, Weld crew B", "Welding", "Welding wire:1"),
+           ("Paint", 4, 8, "Paint booth", "", "Paint:1"),
+           ("Assembly", 16, 28, "Assembly crew", "", ""),
+           ("Test", 4, 6, "Test bay", "Testing", "")]
     routing = []
     for pt, mult in [("Escalator 30deg", 1.0), ("Escalator 35deg", 1.1), ("Moving walk", 0.8)]:
-        for i, (name, fixed, per, res) in enumerate(esc, 1):
-            routing.append([pt, i, name, fixed, round(per * mult, 1), res])
+        for i, (name, fixed, per, res, skill, mat) in enumerate(esc, 1):
+            routing.append([pt, i, name, fixed, round(per * mult, 1), res, skill, mat])
     routing = pd.DataFrame(routing, columns=ROUTING)
     resources = pd.DataFrame([
-        ["Frame crew", 3, 8, 100, "Mon,Tue,Wed,Thu,Fri"],
-        ["Weld crew A", 2, 8, 90, "Mon,Tue,Wed,Thu,Fri"],
-        ["Weld crew B", 2, 8, 100, "Mon,Tue,Wed,Thu,Fri"],
-        ["Paint booth", 2, 8, 100, "Mon,Tue,Wed,Thu,Fri"],
-        ["Assembly crew", 4, 8, 100, "Mon,Tue,Wed,Thu,Fri"],
-        ["Test bay", 1, 8, 100, "Mon,Tue,Wed,Thu,Fri"],
+        ["Frame crew", 3, 8, 100, "Mon,Tue,Wed,Thu,Fri", 1, 0, "Framing"],
+        ["Weld crew A", 2, 8, 90, "Mon,Tue,Wed,Thu,Fri", 1, 0, "Welding"],
+        ["Weld crew B", 2, 8, 100, "Mon,Tue,Wed,Thu,Fri", 1, 0, "Welding"],
+        ["Paint booth", 2, 8, 100, "Mon,Tue,Wed,Thu,Fri", 1, 2, "Painting"],
+        ["Assembly crew", 4, 8, 100, "Mon,Tue,Wed,Thu,Fri", 1, 4, "Assembly"],
+        ["Test bay", 1, 8, 100, "Mon,Tue,Wed,Thu,Fri", 1, 0, "Testing"],
     ], columns=RESOURCES)
     exceptions = pd.DataFrame([
         ["ALL", d(21), d(21), 0, "Public holiday"],
@@ -60,8 +66,12 @@ def example(today=None):
         ["PO-1002", "Steel truss", 1, d(10)],
         ["PO-1004", "Steps and chain", 4, d(18)],
     ], columns=PARTS)
+    stock = pd.DataFrame([
+        ["Steel profile", None, 40], ["Steel profile", d(14), 30],
+        ["Welding wire", None, 60], ["Paint", None, 12], ["Paint", d(21), 20],
+    ], columns=STOCK)
     return {"orders": orders, "routing": routing, "resources": resources,
-            "exceptions": exceptions, "parts": parts}
+            "exceptions": exceptions, "parts": parts, "stock": stock}
 
 
 # ---------- cleaning ----------
@@ -109,13 +119,13 @@ def normalize(tables):
     return out
 
 
-def parse_days(text):
-    """'Mon,Tue' -> {0,1}. Also accepts 'Mon-Fri' and numbers 1-7."""
+def parse_days_checked(text):
+    """'Mon,Tue' -> ({0,1}, []). Also accepts 'Mon-Fri' and numbers 1-7. Second item lists words not understood."""
     s = _text(text).lower()
     if not s:
-        return {0, 1, 2, 3, 4}
+        return {0, 1, 2, 3, 4}, []
     names = [n.lower() for n in DAYNAMES]
-    found = set()
+    found, bad = set(), []
     for part in s.replace(";", ",").replace(" ", ",").split(","):
         part = part.strip()
         if not part:
@@ -130,12 +140,45 @@ def parse_days(text):
                     if k == j:
                         break
                     k = (k + 1) % 7
+            else:
+                bad.append(part)
             continue
         if part[:3] in names:
             found.add(names.index(part[:3]))
         elif part.isdigit() and 1 <= int(part) <= 7:
             found.add(int(part) - 1)
-    return found
+        else:
+            bad.append(part)
+    return found, bad
+
+
+def parse_days(text):
+    return parse_days_checked(text)[0]
+
+
+class Cap(dict):
+    """Capacity per resource and day, plus extra inputs for the solver (stock, changeover, clock hours)."""
+    supply = {}      # material -> cumulative units available by day index
+    changeover = {}  # resource -> labor hours lost when two product types share a day
+    clock = {}       # resource -> clock hours of the working day, per day index
+
+
+def parse_materials(text):
+    """'Steel profile:2, Bolts:10' -> {'Steel profile': 2.0, 'Bolts': 10.0}; None if a quantity is not a number."""
+    out = {}
+    for part in _text(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, q = part.partition(":")
+        name = name.strip()
+        try:
+            qty = float(q) if q.strip() else 1.0
+        except ValueError:
+            return None
+        if name:
+            out[name] = out.get(name, 0.0) + qty
+    return out
 
 
 def prepare(tables, plan_start, settings):
@@ -152,7 +195,9 @@ def prepare(tables, plan_start, settings):
     index = {d: i for i, d in enumerate(days)}
 
     # resources and capacity
-    cap = {}
+    cap = Cap()
+    cap.supply, cap.changeover, cap.clock = {}, {}, {}
+    skills = {}
     for _, r in t["resources"].iterrows():
         name = _text(r["resource"])
         if not name:
@@ -160,12 +205,29 @@ def prepare(tables, plan_start, settings):
         crew = _num(r["crew_size"], 1)
         shift = _num(r["hours_per_shift"], 8)
         eff = _num(r["efficiency_pct"], 100)
+        shifts = _num(r["shifts_per_day"], 1)
+        co = _num(r["changeover_hours"], 0)
         if crew is None or crew < 0 or shift is None or shift < 0 or eff is None or eff < 0:
             problems.append(f"Crews and machines: '{name}' has a negative or blank number.")
             continue
-        wd = parse_days(r["work_days"])
-        base = int(math.floor(crew * shift * eff / 100.0))
+        if shifts is None or shifts < 1 or shifts > 3:
+            problems.append(f"Crews and machines: '{name}' shifts per day must be 1, 2 or 3. Using 1.")
+            shifts = 1
+        if co is None or co < 0:
+            problems.append(f"Crews and machines: '{name}' changeover hours must be 0 or more. Using 0.")
+            co = 0
+        wd, bad_days = parse_days_checked(r["work_days"])
+        if bad_days:
+            problems.append(f"Crews and machines: '{name}' work days has '{', '.join(bad_days)}', which is not a day. "
+                            "Use names like Mon,Tue,Wed or Mon-Fri. " +
+                            ("Using the days that were understood." if wd else "Using Mon-Fri until you fix it."))
+        if not wd:
+            wd = {0, 1, 2, 3, 4}
+        base = int(math.floor(crew * shift * shifts * eff / 100.0))
         cap[name] = [base if d.weekday() in wd else 0 for d in days]
+        cap.clock[name] = [shift * shifts if d.weekday() in wd else 0 for d in days]
+        cap.changeover[name] = int(math.ceil(co))
+        skills[name] = {x.strip().lower() for x in _text(r["skills"]).split(",") if x.strip()}
     for _, e in t["exceptions"].iterrows():
         target = _text(e["resource"])
         a, b = _date(e["from_date"]), _date(e["to_date"]) or _date(e["from_date"])
@@ -181,13 +243,27 @@ def prepare(tables, plan_start, settings):
             crew = _num(row["crew_size"], 1) or 0
             shift = _num(row["hours_per_shift"], 8)
             eff = _num(row["efficiency_pct"], 100)
-            wd = parse_days(row["work_days"])
-            hours_left = int(math.floor(min(crew_left, crew if crew > 0 else crew_left) * shift * eff / 100.0))
+            shifts = min(3, max(1, _num(row["shifts_per_day"], 1) or 1))
+            wd = parse_days(row["work_days"]) or {0, 1, 2, 3, 4}
+            hours_left = int(math.floor(min(crew_left, crew if crew > 0 else crew_left) * shift * shifts * eff / 100.0))
             d = a
             while d <= b:
                 if d in index and d.weekday() in wd:
                     cap[name][index[d]] = hours_left
                 d += timedelta(days=1)
+
+    # stock: units available by each day (blank date = already on hand)
+    for _, sk in t["stock"].iterrows():
+        m = _text(sk["material"])
+        q = _num(sk["quantity"], 0)
+        if not m or q is None or q < 0:
+            continue
+        arr = _date(sk["available_from"])
+        i0 = 0 if (arr is None or arr <= plan_start) else (arr - plan_start).days
+        cum = cap.supply.setdefault(m, [0] * horizon)
+        if i0 < horizon:
+            for i in range(i0, horizon):
+                cum[i] += int(math.floor(q))
 
     # routing
     routes = {}
@@ -239,12 +315,30 @@ def prepare(tables, plan_start, settings):
             fixed = _num(r["fixed_hours"], 0)
             per = _num(r["hours_per_unit"], 0)
             names = [x.strip() for x in _text(r["resources"]).split(",") if x.strip()]
+            need_skills = {x.strip().lower() for x in _text(r["skill_required"]).split(",") if x.strip()}
+            if not names and need_skills:
+                names = [n for n in cap if need_skills <= skills.get(n, set())]
             if not names:
                 bad = f"Routing for '{pt}' step '{_text(r['step_name'])}' lists no resource."
                 break
             unknown = [n for n in names if n not in cap]
             if unknown:
                 bad = f"Routing step '{_text(r['step_name'])}' uses unknown resource: {', '.join(unknown)}."
+                break
+            if need_skills:
+                names = [n for n in names if need_skills <= skills.get(n, set())]
+                if not names:
+                    bad = (f"No listed crew has the skill '{_text(r['skill_required'])}' needed for step "
+                           f"'{_text(r['step_name'])}'. Add the skill to a crew in Crews and machines.")
+                    break
+            mats = parse_materials(r["materials"])
+            if mats is None:
+                bad = f"Routing step '{_text(r['step_name'])}': materials must look like  Steel:2, Bolts:10."
+                break
+            no_stock = [m for m in mats if m not in cap.supply]
+            if no_stock:
+                bad = (f"Routing step '{_text(r['step_name'])}' needs material '{no_stock[0]}' which is not in "
+                       "Materials and stock.")
                 break
             hours = int(math.ceil(max(0.0, fixed + per * qty)))
             if hours <= 0:
@@ -258,11 +352,12 @@ def prepare(tables, plan_start, settings):
                     earliest_date = max(earliest_date, arr)
             earliest_idx = max(0, (earliest_date - plan_start).days)
             steps.append({"step_no": sno, "name": sname, "hours": hours,
-                          "resources": names, "earliest": earliest_idx})
+                          "resources": names, "earliest": earliest_idx,
+                          "materials": {m: int(math.ceil(q * qty)) for m, q in mats.items() if q * qty > 0}})
         if bad:
             skipped.append({"order_id": oid, "reason": bad})
             continue
-        jobs.append({"order_id": oid, "priority": prio,
+        jobs.append({"order_id": oid, "priority": prio, "product": pt,
                      "due_idx": (due - plan_start).days, "steps": steps})
     return jobs, cap, days, problems, skipped
 
@@ -314,7 +409,7 @@ def from_json(data):
     for name, cols in COLUMNS.items():
         df = pd.DataFrame(data.get(name, []), columns=cols)
         for c in cols:
-            if c.endswith("_date") or c == "start_not_before":
+            if c.endswith("_date") or c in ("start_not_before", "available_from"):
                 df[c] = df[c].map(_date)
         out[name] = df
     return normalize(out)

@@ -1,4 +1,5 @@
 import io
+import os
 from datetime import date, datetime, timezone
 
 import altair as alt
@@ -7,6 +8,7 @@ import streamlit as st
 
 import explain
 import importer
+import drift
 import insights
 import mailer
 
@@ -17,6 +19,7 @@ except ImportError:      # PDF library not installed: the app still works, witho
 import scheduler
 import store
 import tables
+import twofa
 
 st.set_page_config(page_title="Production Planner", layout="wide")
 
@@ -34,21 +37,24 @@ HELP_SETTINGS = {
 
 
 # ---------------- database + login ----------------
+def secret(name, default=None):
+    """Streamlit secret first, then an environment variable (used when self-hosting with Docker)."""
+    try:
+        v = st.secrets.get(name)
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
 @st.cache_resource
 def engine():
-    url = None
-    try:
-        url = st.secrets.get("DATABASE_URL")
-    except Exception:
-        url = None
-    return store.get_engine(url)
+    return store.get_engine(secret("DATABASE_URL"))
 
 
 def invite_code():
-    try:
-        return st.secrets.get("INVITE_CODE")
-    except Exception:
-        return None
+    return secret("INVITE_CODE")
 
 
 def start_session(login_id, action):
@@ -60,7 +66,63 @@ def start_session(login_id, action):
     store.log(user["owner_id"], user["username"], action, "", engine())
 
 
+def smtp_cfg():
+    return {k: secret(k) for k in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")}
+
+
+def second_step_screen():
+    eng = engine()
+    pend = st.session_state["pending_login"]
+    st.title("Production Planner")
+    st.subheader("Two-step sign-in")
+    st.caption("Open your authenticator app and type the 6-digit code. Lost your phone? Use one of your recovery codes instead.")
+    with st.form("second_step"):
+        code = st.text_input("Code", max_chars=20)
+        ok = st.form_submit_button("Sign in", type="primary")
+    if ok:
+        err = store.check_second_step(pend, code, eng)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.pop("pending_login")
+            start_session(pend, "Signed in (two-step)")
+            st.rerun()
+    if st.button("Cancel"):
+        st.session_state.pop("pending_login")
+        st.rerun()
+
+
+def reset_page(token):
+    st.title("Choose a new password")
+    eng = engine()
+    if st.session_state.get("reset_done"):
+        st.success("Password changed. Open the app address without the reset part and sign in.")
+        return
+    uid_, err = store.check_reset(token, eng)
+    if err:
+        st.warning(err)
+        return
+    with st.form("reset_form"):
+        p1 = st.text_input("New password (8+ characters)", type="password")
+        p2 = st.text_input("Type it again", type="password")
+        if st.form_submit_button("Save new password", type="primary"):
+            if p1 != p2:
+                st.error("The two passwords are different.")
+            else:
+                e2 = store.use_reset(token, p1, eng)
+                if e2:
+                    st.error(e2)
+                else:
+                    u = store.get_user(uid_, eng)
+                    store.log(u["owner_id"], u["username"], "Password reset by email link", "", eng)
+                    st.session_state["reset_done"] = True
+                    st.rerun()
+
+
 def login_screen():
+    if "pending_login" in st.session_state:
+        second_step_screen()
+        return
     st.title("Production Planner")
     st.caption("Sign in to plan your factory. Your data is private to your account.")
     eng = engine()
@@ -76,9 +138,34 @@ def login_screen():
                 uid, err = store.check_login(u, p, eng)
                 if err:
                     st.error(err)
+                elif store.get_user(uid, eng)["totp_on"]:
+                    st.session_state["pending_login"] = uid
+                    st.rerun()
                 else:
                     start_session(uid, "Signed in")
                     st.rerun()
+        with st.expander("Forgot your password?"):
+            st.caption("Type your username or your email. If we find you, we send a link that works for 60 minutes.")
+            with st.form("forgot"):
+                who = st.text_input("Username or email")
+                if st.form_submit_button("Send reset link"):
+                    found = store.create_reset(who, eng)
+                    base = (secret("APP_URL") or "").rstrip("/")
+                    if found:
+                        token, mail_to, uname = found
+                        link = f"{base}/?reset={token}" if base else f"?reset={token}"
+                        text_ = (f"Hello {uname},\n\nSomeone asked to reset the password for your Production Planner login.\n"
+                                 f"Open this link within 60 minutes to choose a new password:\n\n{link}\n\n"
+                                 "If this was not you, ignore this email.")
+                        cfg = smtp_cfg()
+                        if mail_to and mailer.smtp_ready(cfg):
+                            mailer.send(cfg, mail_to, "Reset your Production Planner password", text_)
+                        elif not store.is_hosted(eng):
+                            st.info("Email is not set up on this computer, so here is your link (shown only on a local copy):")
+                            st.code(link)
+                            found = None
+                    st.success("If that account exists and has an email address, a reset link is on its way. "
+                               "No email? Ask your admin to reset your password in the Team tab.")
     with tab_up:
         code_needed = store.is_hosted(eng) and invite_code()
         if store.is_hosted(eng) and not invite_code():
@@ -87,12 +174,13 @@ def login_screen():
             with st.form("signup"):
                 u = st.text_input("Choose a username")
                 p = st.text_input("Choose a password (8+ characters)", type="password")
+                em = st.text_input("Email (optional, used to reset your password)")
                 code = st.text_input("Invite code", type="password") if code_needed else ""
                 if st.form_submit_button("Create account"):
                     if code_needed and code != str(invite_code()):
                         st.error("Wrong invite code.")
                     else:
-                        uid, err = store.create_user(u, p, eng)
+                        uid, err = store.create_user(u, p, eng, email=em)
                         if err:
                             st.error(err)
                         else:
@@ -117,13 +205,6 @@ def pdf_button(container, name, body, author="", key=None):
     else:
         container.download_button("Download one-page summary (PDF)", data, file_name="plan_summary.pdf",
                                   mime="application/pdf", key=key)
-
-
-def secret(name, default=None):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
 
 
 def approval_page(token):
@@ -185,6 +266,10 @@ def approval_page(token):
             st.session_state["decided"] = True
 
 
+if "reset" in st.query_params:
+    reset_page(str(st.query_params["reset"]))
+    st.stop()
+
 if "approve" in st.query_params:
     approval_page(str(st.query_params["approve"]))
     st.stop()
@@ -240,6 +325,50 @@ with st.sidebar:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
+    me_row = store.get_user(login_id, eng)
+    with st.expander("My email"):
+        with st.form("email_form"):
+            em_new = st.text_input("Email (for password reset)", value=me_row.get("email") or "")
+            if st.form_submit_button("Save email"):
+                err = store.set_email(login_id, em_new, eng)
+                st.error(err) if err else st.success("Saved.")
+    with st.expander("Two-step sign-in" + (" (on)" if me_row["totp_on"] else "")):
+        if me_row["totp_on"]:
+            st.write("Two-step sign-in is **on**. You need a code from your authenticator app each time you sign in.")
+            if st.button("Turn off two-step sign-in"):
+                store.totp_disable(login_id, eng)
+                audit("Two-step sign-in turned off")
+                st.rerun()
+        else:
+            st.caption("Adds a 6-digit code from an authenticator app (Google Authenticator, Microsoft Authenticator, "
+                       "Authy, 1Password) on top of your password.")
+            if st.button("Set up two-step sign-in"):
+                st.session_state["totp_secret"] = store.totp_start(login_id, eng)
+            sec = st.session_state.get("totp_secret")
+            if sec:
+                url = twofa.uri(sec, me)
+                png = twofa.qr_png(url)
+                if png:
+                    st.image(png, caption="Scan with your authenticator app")
+                st.write("Or type this key into the app:")
+                st.code(sec)
+                with st.form("totp_confirm"):
+                    cc = st.text_input("Enter the 6-digit code the app shows")
+                    if st.form_submit_button("Turn on"):
+                        codes, err = store.totp_confirm(login_id, cc, eng)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.session_state.pop("totp_secret", None)
+                            st.session_state["recovery_codes"] = codes
+                            audit("Two-step sign-in turned on")
+                            st.rerun()
+        if st.session_state.get("recovery_codes"):
+            st.warning("Save these recovery codes now. Each works once if you lose your phone. They will not be shown again.")
+            st.code("\n".join(st.session_state["recovery_codes"]))
+            if st.button("I saved them"):
+                st.session_state.pop("recovery_codes")
+                st.rerun()
     with st.expander("Change password"):
         with st.form("pw"):
             old = st.text_input("Current password", type="password")
@@ -259,6 +388,8 @@ with st.sidebar:
     S["gap_days"] = st.number_input("Days between steps", 0, 30, 1, help=HELP_SETTINGS["gap_days"])
     S["max_overtime"] = st.number_input("Max overtime hours per day", 0, 12, 0, help=HELP_SETTINGS["max_overtime"])
     S["overtime_cost"] = st.number_input("Cost per overtime hour", 0, 1000, 5, help=HELP_SETTINGS["overtime_cost"])
+    S["shift_start_hour"] = st.number_input("Shift starts at (hour)", 0, 23, 8,
+                                            help="Clock hour the working day starts. Used for the hour-by-hour times.")
     S["time_limit_seconds"] = st.number_input("Solver time (seconds)", 5, 300, 20, help=HELP_SETTINGS["time_limit_seconds"])
     st.divider()
     st.header("Money (optional)")
@@ -294,13 +425,23 @@ CFG = {
         "fixed_hours": st.column_config.NumberColumn("Fixed hours", help="Hours needed regardless of quantity (setup).", min_value=0),
         "hours_per_unit": st.column_config.NumberColumn("Hours per unit", help="Extra hours for each unit.", min_value=0),
         "resources": st.column_config.TextColumn("Allowed crews / machines", help="Names from the Crews tab, separated by commas. The planner picks one."),
+        "skill_required": st.column_config.TextColumn("Skill required", help="Optional. Only crews that have this skill (in Crews and machines) can do the step. Example: Welding. Several skills separated by commas, the crew needs all of them."),
+        "materials": st.column_config.TextColumn("Materials per unit", help="Optional. Material:quantity per unit, separated by commas. Example: Steel profile:2, Bolts:10. The names must exist in Materials and stock."),
     },
     "resources": {
         "resource": st.column_config.TextColumn("Crew / machine", help="Name used in Routing."),
         "crew_size": st.column_config.NumberColumn("Crew size", help="People working together (1 for a machine).", min_value=0),
         "hours_per_shift": st.column_config.NumberColumn("Hours per shift", help="Hours each person works per day.", min_value=0),
         "efficiency_pct": st.column_config.NumberColumn("Efficiency %", help="100 = normal. 85 = slower crew.", min_value=0),
-        "work_days": st.column_config.TextColumn("Work days", help="For example Mon,Tue,Wed,Thu,Fri or Mon-Sat."),
+        "work_days": st.column_config.TextColumn("Work days", help="For example Mon,Tue,Wed,Thu,Fri or Mon-Sat. Anything that is not a day name is reported in the Plan tab."),
+        "shifts_per_day": st.column_config.NumberColumn("Shifts per day", help="1, 2 or 3 shifts. Two shifts double the hours a crew can work each day (the same crew size on each shift).", min_value=1, max_value=3),
+        "changeover_hours": st.column_config.NumberColumn("Changeover hours", help="Hours lost when this crew or machine switches to a different product type on the same day (cleaning, tooling, setup). 0 = none.", min_value=0),
+        "skills": st.column_config.TextColumn("Skills", help="Optional. What this crew can do, separated by commas. Example: Welding, Testing. Used with Skill required in Routing."),
+    },
+    "stock": {
+        "material": st.column_config.TextColumn("Material", help="Name used in Routing (Materials per unit)."),
+        "available_from": st.column_config.DateColumn("Available from", help="Blank = already on hand. Otherwise the date a delivery arrives."),
+        "quantity": st.column_config.NumberColumn("Quantity", help="Units on hand or delivered on that date. Add one row for each delivery.", min_value=0),
     },
     "exceptions": {
         "resource": st.column_config.TextColumn("Crew / machine", help="A name from Crews, or ALL for everyone (public holiday)."),
@@ -317,8 +458,9 @@ CFG = {
     },
 }
 NUM = {"quantity", "priority", "step_no", "fixed_hours", "hours_per_unit", "crew_size",
-       "hours_per_shift", "efficiency_pct", "crew_available", "needed_for_step", "order_value"}
-DATE = {"due_date", "start_not_before", "from_date", "to_date", "arrival_date"}
+       "hours_per_shift", "efficiency_pct", "crew_available", "needed_for_step", "order_value",
+       "shifts_per_day", "changeover_hours"}
+DATE = {"due_date", "start_not_before", "from_date", "to_date", "arrival_date", "available_from"}
 
 
 # ---------------- plain-language guides ----------------
@@ -355,13 +497,18 @@ TABLE_INFO = {
                  ("Step", "Name of the step.", "Welding", "Yes"),
                  ("Fixed hours", "Hours needed no matter how many units (setup, drawings, preparation).", "8", "Yes"),
                  ("Hours per unit", "Extra hours for each unit. Total hours = fixed + per unit x units.", "16", "Yes"),
-                 ("Allowed crews / machines", "Who can do this step. Names from the Crews table, separated by commas. The planner picks one.", "Weld crew A, Weld crew B", "Yes")]),
+                 ("Allowed crews / machines", "Who can do this step. Names from the Crews table, separated by commas. The planner picks one.", "Weld crew A, Weld crew B", "Yes"),
+                 ("Skill required", "Only crews that list this skill can do the step.", "Welding", "No"),
+                 ("Materials per unit", "Material:quantity for each unit, from Materials and stock. The step cannot start until enough stock has arrived.", "Steel profile:2, Bolts:10", "No")]),
     "resources": ("What it is: your crews and machines and how many hours of work they can do each day.",
                   [("Crew / machine", "Name. Used in Routing and Calendar exceptions.", "Frame crew", "Yes"),
                    ("Crew size", "People who work together. Use 1 for a single machine.", "3", "Yes"),
                    ("Hours per shift", "Hours each person works per day.", "8", "Yes"),
                    ("Efficiency %", "100 = normal speed. 85 = a slower or newer crew.", "90", "No (default 100)"),
-                   ("Work days", "Days of the week it works. Mon,Tue,Wed or Mon-Fri.", "Mon-Fri", "No (default Mon-Fri)")]),
+                   ("Work days", "Days of the week it works. Mon,Tue,Wed or Mon-Fri.", "Mon-Fri", "No (default Mon-Fri)"),
+                   ("Shifts per day", "1, 2 or 3 shifts. Each extra shift adds another full day of hours.", "2", "No (default 1)"),
+                   ("Changeover hours", "Hours lost when the crew switches to a different product type on the same day.", "4", "No (default 0)"),
+                   ("Skills", "What the crew can do, separated by commas.", "Welding, Testing", "No")]),
     "exceptions": ("What it is: days when capacity is lower than normal: public holidays, vacations, maintenance. Optional.",
                    [("Crew / machine", "A name from Crews, or ALL for everyone (public holiday).", "ALL", "Yes"),
                     ("From", "First day of the exception.", "2026-12-25", "Yes"),
@@ -373,6 +520,10 @@ TABLE_INFO = {
                ("Part", "Description of the part.", "Drive motors", "No"),
                ("Needed for step no.", "Step number that cannot start before the part arrives.", "4", "Yes"),
                ("Arrival date", "Date the part arrives at the factory.", "2026-12-17", "Yes")]),
+    "stock": ("What it is: materials on hand and deliveries still to come. Optional. Steps that list a material in Routing cannot start until enough stock has arrived, and orders share the stock.",
+              [("Material", "Name of the material. Same spelling as in Routing.", "Steel profile", "Yes"),
+               ("Available from", "Blank = on hand now. A date = delivery arrives that day.", "2026-12-10", "No"),
+               ("Quantity", "Units on hand or delivered. One row per delivery.", "40", "Yes")]),
 }
 
 
@@ -394,6 +545,10 @@ The table under it lists every step with its crew, start day, end day and hours.
 **Why late:** the last column explains each late or not scheduled order in plain words (work too long, parts date, or crew busy with other orders).
 
 **Money:** set cost per overtime hour and late penalties in the sidebar, and add Order value in Orders. The plan then shows overtime cost, late penalties and revenue at risk.
+
+**Hour-by-hour view:** under the schedule, pick a day to see the exact clock times each crew works on each order, with changeover time shown separately. Times start at the shift start hour set in the sidebar and show clock hours (a crew of 3 doing 24 work hours works 8 clock hours).
+
+**Materials:** the Materials box shows stock against what the plan needs. If an order waits for stock, the Why column says so.
 
 **Crew and machine load:** a heat map of how full each crew is each day (dark blue = full). Hover to see planned hours, capacity and overtime.
 """
@@ -492,7 +647,24 @@ def plan_excel(res):
         pd.DataFrame(res["steps"]).to_excel(xw, sheet_name="steps", index=False)
         pd.DataFrame(res["daily"]).to_excel(xw, sheet_name="daily_hours", index=False)
         pd.DataFrame(res["load"]).to_excel(xw, sheet_name="resource_load", index=False)
+        if res.get("blocks"):
+            pd.DataFrame(res["blocks"]).to_excel(xw, sheet_name="hour_by_hour", index=False)
     return buf.getvalue()
+
+
+def keep_result(res, jobs, cap, days, d, chosen):
+    """Put a finished plan into the session (why-late text, order values, inputs for later what-ifs)."""
+    why = explain.explain(jobs, cap, days, res, S)
+    values = {str(r_["order_id"]).strip(): r_.get("order_value") for _, r_ in d["orders"].iterrows()}
+    for o_ in res["orders"]:
+        o_["why"] = why.get(o_["order_id"], "")
+        v_ = values.get(o_["order_id"])
+        o_["value"] = None if (v_ is None or pd.isna(v_)) else float(v_)
+    st.session_state["result"] = res
+    st.session_state["result_meta"] = {"start": plan_start, "S": dict(S), "n": len(jobs), "M": dict(M),
+                                       "statuses": list(chosen)}
+    st.session_state["plan_inputs"] = {k: v.copy() for k, v in d.items()}
+    st.session_state["plan_model"] = {"jobs": jobs, "cap": cap, "days": days, "chosen": list(chosen)}
 
 
 with tab_plan:
@@ -524,16 +696,9 @@ with tab_plan:
             if res["status"] == "none":
                 st.error("No plan found. Try more solver time or more days.")
             else:
-                why = explain.explain(jobs, cap, days, res, S)
-                values = {str(r_["order_id"]).strip(): r_.get("order_value") for _, r_ in d["orders"].iterrows()}
-                for o_ in res["orders"]:
-                    o_["why"] = why.get(o_["order_id"], "")
-                    v_ = values.get(o_["order_id"])
-                    o_["value"] = None if (v_ is None or pd.isna(v_)) else float(v_)
-                st.session_state["result"] = res
-                st.session_state["result_meta"] = {"start": plan_start, "S": dict(S), "n": len(jobs), "M": dict(M),
-                                                   "statuses": list(chosen)}
-                st.session_state["plan_inputs"] = {k: v.copy() for k, v in d.items()}
+                keep_result(res, jobs, cap, days, d, chosen)
+                st.session_state.pop("locks", None)
+                st.session_state.pop("replan_note", None)
                 st.session_state.pop("options", None)
                 st.session_state.pop("promise", None)
 
@@ -616,6 +781,115 @@ with tab_plan:
             st.altair_chart(ch.properties(height=max(200, 34 * g[("order_id" if view == "Order" else "resource")].nunique())),
                             width="stretch")
             st.dataframe(steps, hide_index=True, width="stretch")
+
+            blocks = pd.DataFrame(res.get("blocks") or [])
+            if len(blocks):
+                with st.expander("Hour-by-hour view (clock times for one day)"):
+                    day_opts = sorted(blocks["date"].unique())
+                    pick_day = st.selectbox("Day", day_opts, format_func=lambda d_: d_.strftime("%a %d %b %Y"), key="hour_day")
+                    bd = blocks[blocks["date"] == pick_day].copy()
+                    bd["start_time"] = pd.to_datetime(bd["start_time"])
+                    bd["end_time"] = pd.to_datetime(bd["end_time"])
+                    bd["label"] = bd["order_id"].astype(str) + " " + bd["step_name"].astype(str)
+                    hc_ = alt.Chart(bd).mark_bar().encode(
+                        x=alt.X("start_time:T", title=None, axis=alt.Axis(format="%H:%M")), x2="end_time:T",
+                        y=alt.Y("resource:N", title=None),
+                        color=alt.Color("order_id:N", title="Order"),
+                        tooltip=["label", "resource", "start_time", "end_time", "hours", "kind"])
+                    st.altair_chart(hc_.properties(height=max(120, 40 * bd["resource"].nunique())), width="stretch")
+                    st.dataframe(bd.assign(start=bd["start_time"].dt.strftime("%H:%M"), end=bd["end_time"].dt.strftime("%H:%M"))
+                                 [["resource", "start", "end", "order_id", "step_name", "hours", "kind"]].sort_values(["resource", "start"]),
+                                 hide_index=True, width="stretch")
+                    st.caption("Hours are work hours of the whole crew; start and end are clock times. Changeover rows are time "
+                               "lost switching between product types.")
+            pm_ = st.session_state.get("plan_model")
+            if pm_ and getattr(pm_["cap"], "supply", None):
+                sup = pm_["cap"].supply
+                planned_ids = set(orders.loc[orders["status"].isin(["On time", "Late"]), "order_id"])
+                need = {}
+                for j_ in pm_["jobs"]:
+                    if j_["order_id"] in planned_ids:
+                        for st_ in j_["steps"]:
+                            for m_, q_ in (st_.get("materials") or {}).items():
+                                need[m_] = need.get(m_, 0) + q_
+                if need:
+                    with st.expander("Materials: stock against what the plan uses"):
+                        st.dataframe(pd.DataFrame([{"material": m_, "stock in the planned days": sup[m_][-1] if m_ in sup else 0,
+                                                    "used by planned orders": q_,
+                                                    "left over": (sup[m_][-1] if m_ in sup else 0) - q_} for m_, q_ in need.items()]),
+                                     hide_index=True, width="stretch")
+
+            if CAN_EDIT and st.session_state.get("plan_model"):
+                with st.expander("Adjust the schedule: lock a step, then re-plan around it"):
+                    st.caption("Tick Lock on any step you want to fix (for example a job that is already started, or a date "
+                               "promised to a customer). You may also change its crew, start day or end day. Press Re-plan "
+                               "and every other step is moved around your locks.")
+                    pm = st.session_state["plan_model"]
+                    locks = st.session_state.get("locks", {})
+                    allowed = {(j["order_id"], st_["step_no"]): st_["resources"] for j in pm["jobs"] for st_ in j["steps"]}
+                    ed = steps[["order_id", "step_no", "step_name", "resource", "start", "end"]].copy()
+                    ed["Lock"] = [(r_.order_id, r_.step_no) in locks for r_ in ed.itertuples()]
+                    ed["start"] = pd.to_datetime(ed["start"]).dt.date
+                    ed["end"] = pd.to_datetime(ed["end"]).dt.date
+                    ed = ed[["Lock", "order_id", "step_no", "step_name", "resource", "start", "end"]]
+                    edited = st.data_editor(
+                        ed, hide_index=True, width="stretch", key="lock_editor",
+                        disabled=["order_id", "step_no", "step_name"],
+                        column_config={"Lock": st.column_config.CheckboxColumn("Lock"),
+                                       "resource": st.column_config.SelectboxColumn(
+                                           "Crew / machine", options=sorted({r for v in allowed.values() for r in v}))})
+                    if st.button("Re-plan with my locks", type="primary", key="replan_btn"):
+                        new_locks, bad = {}, []
+                        d0 = pm["days"][0]
+                        for r_ in edited.itertuples():
+                            if not r_.Lock:
+                                continue
+                            key = (r_.order_id, r_.step_no)
+                            if r_.resource not in allowed[key]:
+                                bad.append(f"{r_.order_id} step {r_.step_no}: {r_.resource} cannot do this step.")
+                            elif r_.end < r_.start:
+                                bad.append(f"{r_.order_id} step {r_.step_no}: the end day is before the start day.")
+                            else:
+                                new_locks[key] = {"resource": r_.resource, "start": (r_.start - d0).days, "end": (r_.end - d0).days}
+                        if bad:
+                            for b_ in bad:
+                                st.error(b_)
+                        else:
+                            import copy
+                            jobs2 = copy.deepcopy(pm["jobs"])
+                            for j_ in jobs2:
+                                for st_ in j_["steps"]:
+                                    lk = new_locks.get((j_["order_id"], st_["step_no"]))
+                                    if lk:
+                                        st_["lock"] = lk
+                            with st.spinner("Re-planning around your locks ..."):
+                                res2 = scheduler.solve(jobs2, pm["cap"], pm["days"], meta["S"])
+                            if res2["status"] == "none":
+                                st.error("The locks cannot all fit together (for example a step is locked into too few days "
+                                         "for its hours, a crew is double booked, or a later step is locked before an "
+                                         "earlier one ends). Remove or widen some locks and try again.")
+                            else:
+                                before = full_body(res, meta)
+                                keep_result(res2, jobs2, pm["cap"], pm["days"], st.session_state["plan_inputs"], pm["chosen"])
+                                st.session_state["locks"] = new_locks
+                                after = full_body(res2, meta)
+                                o_cmp, s_cmp = insights.compare_plans(before, after)
+                                st.session_state["replan_note"] = {"orders": o_cmp[o_cmp["change"] != "Same"], "steps": s_cmp,
+                                                                   "n_locks": len(new_locks)}
+                                st.session_state.pop("options", None)
+                                st.session_state.pop("promise", None)
+                                audit("Plan re-planned with locks", f"{len(new_locks)} steps locked")
+                                st.rerun()
+                    note = st.session_state.get("replan_note")
+                    if note:
+                        st.success(f"Re-planned with {note['n_locks']} locked steps. What changed compared with the plan before:")
+                        if len(note["orders"]):
+                            st.dataframe(note["orders"], hide_index=True, width="stretch")
+                        else:
+                            st.write("No order finish date or status changed.")
+                        if len(note["steps"]):
+                            with st.expander("Every step that moved"):
+                                st.dataframe(note["steps"], hide_index=True, width="stretch")
 
         if len(load):
             st.subheader("Crew and machine load")
@@ -718,25 +992,7 @@ with tab_plan:
 # ---------------- saved tab ----------------
 def drift_check(body):
     """Re-plan today's data with the saved plan's settings. Returns (changes, error)."""
-    cfg = body.get("settings") or {}
-    if not cfg.get("start"):
-        return None, "This plan has no saved settings."
-    start = date.fromisoformat(str(cfg["start"])[:10])
-    S2 = {k: cfg[k] for k in scheduler.DEFAULT_SETTINGS if k in cfg}
-    S2["time_limit_seconds"] = min(int(S2.get("time_limit_seconds", 20)), 20)
-    d = current_tables()
-    o = d["orders"]
-    kept = body.get("statuses")
-    if kept:
-        blank_ok = o["status"].isna() | (o["status"].astype(str).str.strip() == "")
-        d["orders"] = o[blank_ok | o["status"].astype(str).str.strip().isin(kept)]
-    jobs, cap, days, problems, skipped = tables.prepare(d, start, S2)
-    if not jobs:
-        return None, "There are no valid orders in your current data."
-    new = scheduler.solve(jobs, cap, days, S2)
-    if new["status"] == "none":
-        return None, "No plan could be built from the current data."
-    return insights.drift(body.get("orders", []), new["orders"]), None
+    return drift.check(body, current_tables())
 
 
 with tab_saved:
@@ -890,6 +1146,51 @@ with tab_saved:
     else:
         st.write("No saved plans yet.")
 
+    if plans:
+        st.subheader("Progress over time")
+        hist_items = []
+        for it in plans:
+            b_ = store.load_item("plans", uid, it["id"], eng) or {}
+            if b_.get("orders"):
+                hist_items.append((str(it["created"]), insights.plan_metrics(b_)))
+        hist = insights.weekly_history(hist_items)
+        if len(hist) >= 1:
+            st.caption("One point per week, using the last plan saved that week. Rising on-time rate and falling late days "
+                       "and overtime mean things are improving.")
+            long = hist.melt("week", ["on_time_pct", "late_days", "overtime_h"], var_name="measure", value_name="value")
+            long["measure"] = long["measure"].map({"on_time_pct": "On-time rate (%)", "late_days": "Late days",
+                                                   "overtime_h": "Overtime hours"})
+            hc = alt.Chart(long).mark_line(point=True).encode(
+                x=alt.X("week:T", title="Week starting"), y=alt.Y("value:Q", title=None),
+                color=alt.Color("measure:N", title=None, legend=None), tooltip=["week", "measure", "value"]
+            ).properties(height=170).facet(column=alt.Column("measure:N", title=None)).resolve_scale(y="independent")
+            st.altair_chart(hc)
+            if len(hist) == 1:
+                st.caption("Save plans in different weeks to see a trend.")
+        if len(plans) >= 2:
+            st.subheader("Compare two plans")
+            names = {it["id"]: f"{it['name']} ({it['created']})" for it in plans}
+            ca, cb = st.columns(2)
+            pa = ca.selectbox("Plan A (before)", list(names), format_func=names.get, key="cmp_a")
+            pb = cb.selectbox("Plan B (after)", list(names), format_func=names.get, index=min(1, len(names) - 1), key="cmp_b")
+            if pa == pb:
+                st.info("Pick two different plans.")
+            else:
+                ba = store.load_item("plans", uid, pa, eng) or {}
+                bb = store.load_item("plans", uid, pb, eng) or {}
+                ma, mb = insights.plan_metrics(ba), insights.plan_metrics(bb)
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("On time", mb["on_time"], mb["on_time"] - ma["on_time"])
+                k2.metric("Late orders", mb["late"], mb["late"] - ma["late"], delta_color="inverse")
+                k3.metric("Late days", mb["late_days"], mb["late_days"] - ma["late_days"], delta_color="inverse")
+                k4.metric("Overtime hours", mb["overtime_h"], mb["overtime_h"] - ma["overtime_h"], delta_color="inverse")
+                o_c, s_c = insights.compare_plans(ba, bb)
+                only = st.checkbox("Show only what changed", value=True)
+                st.dataframe(o_c[o_c["change"] != "Same"] if only else o_c, hide_index=True, width="stretch")
+                if len(s_c):
+                    with st.expander(f"{len(s_c)} steps moved or changed crew"):
+                        st.dataframe(s_c, hide_index=True, width="stretch")
+
     st.subheader("Feedback")
     with st.form("fb", clear_on_submit=True):
         txt = st.text_area("What worked, what is missing, what was wrong?")
@@ -910,12 +1211,13 @@ if tab_team is not None:
             members = store.list_members(uid, eng)
             st.dataframe(pd.DataFrame(members).drop(columns=["id"]), hide_index=True, width="stretch")
             with st.form("add_member", clear_on_submit=True):
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
+                nem = m4.text_input("Email (optional)")
                 nu = m1.text_input("New username")
                 npw = m2.text_input("Temporary password (8+ characters)", type="password")
                 nr = m3.selectbox("Role", ["planner", "manager", "viewer"])
                 if st.form_submit_button("Add team member"):
-                    err = store.add_member(uid, nu, npw, nr, eng)
+                    err = store.add_member(uid, nu, npw, nr, eng, email=nem)
                     if err:
                         st.error(err)
                     else:
@@ -931,6 +1233,7 @@ if tab_team is not None:
                     r1, r2 = st.columns(2)
                     do_pw = r1.form_submit_button("Reset password")
                     do_rm = r2.form_submit_button("Remove member")
+                    do_2fa = st.form_submit_button("Turn off their two-step sign-in (lost phone)")
                     uname = next(m["username"] for m in others if m["id"] == who)
                     if do_pw:
                         err = store.reset_member_password(uid, who, new_pw, eng)
@@ -939,6 +1242,10 @@ if tab_team is not None:
                         else:
                             audit("Member password reset", uname)
                             st.success("Password reset.")
+                    if do_2fa:
+                        store.totp_disable(who, eng)
+                        audit("Member two-step turned off", uname)
+                        st.success("Done. They can sign in with the password and set it up again.")
                     if do_rm:
                         store.remove_member(uid, who, eng)
                         audit("Team member removed", uname)

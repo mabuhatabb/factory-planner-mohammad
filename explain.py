@@ -43,6 +43,23 @@ def _asap(job, cap, horizon, gap, max_ot, ignore_earliest=False):
     return prev_end, out
 
 
+def _with_material_dates(job, cap, horizon):
+    """Copy of the job whose steps cannot start before the stock for them has arrived (if it ever does)."""
+    supply = getattr(cap, "supply", {}) or {}
+    new = dict(job)
+    new["steps"] = []
+    for st in job["steps"]:
+        st2 = dict(st)
+        for m, q in (st.get("materials") or {}).items():
+            have = supply.get(m, [0] * horizon)
+            day = next((d for d in range(horizon) if have[d] >= q), horizon)
+            if day > st2["earliest"]:
+                st2["earliest"] = day
+                st2["wait_material"] = (m, q, day)
+        new["steps"].append(st2)
+    return new
+
+
 def explain(jobs, cap, days, res, settings):
     """Returns {order_id: reason text} for late and not scheduled orders."""
     s = dict(scheduler.DEFAULT_SETTINGS)
@@ -63,6 +80,7 @@ def explain(jobs, cap, days, res, settings):
         job = by_id[oid]
         if status == "On time":
             continue
+        job = _with_material_dates(job, cap, horizon)
         alone = _asap(job, cap, horizon, gap, max_ot)
         if status == "Not scheduled":
             bad = None
@@ -94,6 +112,12 @@ def explain(jobs, cap, days, res, settings):
             free = _asap(job, cap, horizon, gap, max_ot, ignore_earliest=True)
             if free and free[0] <= due:
                 late_step = max(job["steps"], key=lambda st: st["earliest"])
+                wm = late_step.get("wait_material")
+                if wm:
+                    out[oid] = (f"Waiting for material: step '{late_step['name']}' needs {wm[1]} of '{wm[0]}', and that much "
+                                f"stock is only available from {_fmt(days[min(horizon - 1, wm[2])])}. Even with every crew free "
+                                f"it finishes {_fmt(days[lb])}. Order more stock or ask for an earlier delivery.")
+                    continue
                 out[oid] = (f"Cannot be on time because work cannot start until {_fmt(days[min(horizon - 1, late_step['earliest'])])} "
                             f"(its earliest start or parts arrival, step '{late_step['name']}'). Even with every crew free "
                             f"it finishes {_fmt(days[lb])}, after the due date {_fmt(days[min(horizon - 1, max(0, due))]) if due < horizon else 'in the future'}.")
@@ -116,6 +140,20 @@ def explain(jobs, cap, days, res, settings):
                 worst = (extra, row, b, actual_end)
         extra, row, b, actual_end = worst
         r = row["resource"]
+        # was it really the stock? (the step started the day stock became enough, and others had used the earlier stock)
+        supply = getattr(cap, "supply", {}) or {}
+        start_i = idx[row["start"]]
+        for m, q in (next(st for st in job["steps"] if st["step_no"] == row["step_no"]).get("materials") or {}).items():
+            have = supply.get(m, [0] * horizon)
+            taken = sum(by_id[x["order_id"]]["steps"][[z["step_no"] for z in by_id[x["order_id"]]["steps"]].index(x["step_no"])]
+                        .get("materials", {}).get(m, 0)
+                        for x in res["steps"] if idx[x["start"]] < start_i and not (x["order_id"] == oid and x["step_no"] == row["step_no"]))
+            if start_i > 0 and taken + q > have[start_i - 1] and extra > 0 and have[start_i] >= taken + q:
+                out[oid] = (f"Waiting for material: step '{row['step_name']}' needs {q} of '{m}'. Earlier orders used the stock "
+                            f"on hand and enough only arrived on {_fmt(days[start_i])}. Order more stock or ask for an earlier delivery.")
+                break
+        if oid in out:
+            continue
         others = defaultdict(int)
         for d in range(max(0, b), actual_end + 1):
             for other, h in daily.get((r, d), {}).items():
@@ -128,6 +166,10 @@ def explain(jobs, cap, days, res, settings):
         else:
             out[oid] = (f"On its own it could finish by {_fmt(days[lb])}. Step '{row['step_name']}' on {r} ran later because of "
                         f"the crew calendar (holidays, vacation, maintenance) or limited hours.")
+    for oid in list(out):
+        mats = sorted({m for st in by_id[oid]["steps"] for m in (st.get("materials") or {})})
+        if mats and "Waiting for material" not in out[oid]:
+            out[oid] += f" Stock of {', '.join(mats)} is shared with other orders and can also cause waiting."
     return out
 
 
